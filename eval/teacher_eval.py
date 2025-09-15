@@ -11,10 +11,11 @@ import torch
 from typing import List, Dict
 
 from data.load_medmnist import prepare_datasets
-from model.model_wrapper import QwenVLWithUnlearning
+from model.model_wrapper import GenerativeQwenVLModel as QwenVLWithUnlearning
 from config import config
 
 
+# 保留原接口签名，内部不会实际使用
 def evaluate_dataset(model: QwenVLWithUnlearning, data: List[Dict], name: str, batch_size: int = 8) -> float:
     """
     使用老师模型（forward_teacher）对给定数据集进行预测并计算准确率。

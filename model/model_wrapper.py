@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
-from typing import List, Union
-from transformers import AutoModel, AutoProcessor
-from model.unlearning_layer import UnlearningLayer
+from typing import List, Union, Optional
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+import torch.nn.functional as F
 
 try:
     from torchvision.transforms.functional import to_pil_image
@@ -11,36 +11,33 @@ except Exception:
     to_pil_image = None
 
 
-class QwenVLWithUnlearning(nn.Module):
+class GenerativeQwenVLModel(nn.Module):
     """
-    使用真实 Qwen2.5-VL 作为冻结骨干，取其隐藏表示作为融合特征，插入遗忘层并接冻结分类头。
-    与现有 trainer/eval 对接：forward/forward_teacher 返回包含 .logits 的对象，shape=[B, num_classes]
+    生成式Qwen2.5-VL模型，用于KGA框架的image-text-to-text任务。
+    支持：
+    1. generate: 生成式推理
+    2. compute_nll: 计算给定target的负对数似然（用于KGA知识差距计算）
+    3. forward: 返回包含logits的对象以兼容旧接口
     """
 
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct", num_classes: int = 7, use_fast: bool = False):
+    def __init__(self, model_name: str = "FreedomIntelligence/HuatuoGPT-Vision-7B-Qwen2.5VL", use_fast: bool = False):
         super().__init__()
         # 设备选择：优先使用GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # 1) 加载多模态模型与处理器（信任远程代码以启用自定义多模态前向）
-        self.backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(self.device)
-        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, use_fast=use_fast)
-
-        # 冻结骨干参数
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-        # 2) 设定融合表示维度（以 hidden_size 为准）
-        hidden_size = getattr(self.backbone.config, "hidden_size", None)
-        if hidden_size is None:
-            # 兜底：尝试常见字段或给一个保守默认
-            hidden_size = getattr(self.backbone.config, "text_config", {}).get("hidden_size", 1024)
-        self.hidden_size = int(hidden_size)
-
-        # 3) 遗忘层 + 冻结分类头（输出与任务类别一致）
-        self.unlearning_layer = UnlearningLayer(input_dim=self.hidden_size).to(self.device)
-        self.classifier = nn.Linear(self.hidden_size, num_classes).to(self.device)
-        for p in self.classifier.parameters():
-            p.requires_grad = False
+        self.max_seq_len = 2048  # 针对对话式长文本设置上下文上限
+        
+        # 加载生成式多模态模型与处理器
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_name, 
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        ).to(self.device)
+        
+        self.processor = AutoProcessor.from_pretrained(
+            model_name, 
+            trust_remote_code=True, 
+            use_fast=use_fast
+        )
 
     def _ensure_pil_list(self, images: Union[torch.Tensor, "PIL.Image.Image", List]) -> List:
         """将输入统一为 PIL 图像列表，方便交给 AutoProcessor 处理。"""
@@ -81,70 +78,219 @@ class QwenVLWithUnlearning(nn.Module):
                 processed.append(img)
         return processed
 
-    def _prepare_inputs(self, images, texts, device: torch.device):
+    # 新增：将任意输入规格统一为“每条样本一个PIL列表”的批格式 List[List[PIL]]
+    def _ensure_pil_per_sample(self, images) -> List[List]:
+        """支持以下输入：
+        - 单张图：PIL/tensor -> [[PIL]]
+        - 单样本多图：List[PIL/tensor] -> [List[PIL]]
+        - Batch：List[ Pils 或 List[PIL] ] -> List[List[PIL]]
+        """
+        def to_pil(x):
+            return self._ensure_pil_list(x)[0] if not isinstance(x, list) else [self._ensure_pil_list(i)[0] for i in x]
+
+        if isinstance(images, list):
+            # 判定是否为 batch（元素本身是列表或混合）
+            if any(isinstance(el, list) for el in images):
+                batch = []
+                for el in images:
+                    if isinstance(el, list):
+                        batch.append(self._ensure_pil_list(el))
+                    else:
+                        batch.append(self._ensure_pil_list(el))  # 单图样本
+                return batch
+            else:
+                # 单样本多图
+                return [self._ensure_pil_list(images)]
+        else:
+            # 单样本单图
+            return [[self._ensure_pil_list(images)[0]]]
+
+    def _prepare_inputs(self, images, texts, targets: Optional[List[str]] = None):
+        """准备模型输入；当提供targets时，构造labels与input_ids等长，并对prompt部分置-100。
+        支持原生多图：images可以是 List[List[PIL]]（batch级），或 List[PIL]（单样本多图），或单图。
+        """
         # texts 统一成列表
         if isinstance(texts, str):
             texts = [texts]
-        # 图像转为 PIL 列表
-        image_list = self._ensure_pil_list(images)
-        # 对齐长度：若文本为1条则广播到图像数
-        if len(texts) == 1 and len(image_list) > 1:
-            texts = [texts[0] for _ in range(len(image_list))]
-        if len(texts) != len(image_list):
-            raise ValueError(f"Texts and images count mismatch: {len(texts)} vs {len(image_list)}")
+        # 图像规范化为“每条样本的图像列表”的批格式
+        images_per_sample = self._ensure_pil_per_sample(images)  # List[List[PIL]]
+        B = len(images_per_sample)
 
-        # 为 Qwen2.5-VL 构造对话模板，插入图像占位符
-        conversations = []
-        for t in texts:
-            conversations.append([
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": t}
-                ]}
-            ])
-        # 生成包含视觉占位符的文本（区分单样本与批量）
-        if len(texts) == 1:
-            prompt_texts = [self.processor.apply_chat_template(conversations[0], tokenize=False, add_generation_prompt=False)]
+        # 文本广播/对齐
+        if len(texts) == 1 and B > 1:
+            texts = [texts[0] for _ in range(B)]
+        if len(texts) != B:
+            raise ValueError(f"Texts and images batch size mismatch: {len(texts)} vs {B}")
+
+        # 构造仅prompt的对话（多次 {image} + text）
+        convs_user_only = []
+        for t, imgs in zip(texts, images_per_sample):
+            content = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
+            convs_user_only.append([{ "role": "user", "content": content }])
+
+        if targets is None:
+            # 推理：只构造用户轮，添加generation prompt
+            prompt_texts = self.processor.apply_chat_template(
+                convs_user_only, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.processor(
+                text=prompt_texts, images=images_per_sample,
+                return_tensors="pt", padding=True, truncation=True, max_length=self.max_seq_len
+            )
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(self.device)
+            return inputs
         else:
-            prompt_texts = self.processor.apply_chat_template(conversations, tokenize=False, add_generation_prompt=False)
+            # 统一targets长度
+            if isinstance(targets, str):
+                targets = [targets]
+            if len(targets) == 1 and B > 1:
+                targets = [targets[0] for _ in range(B)]
+            if len(targets) != B:
+                raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
 
-        # 编码为模型输入（包含图像特征与带占位符的文本）
-        inputs = self.processor(text=prompt_texts, images=image_list, return_tensors="pt", padding=True)
-        # 移动到设备
-        for k, v in list(inputs.items()):
+            # 1) 获取每条样本prompt的token长度（包含多图占位）
+            prompt_token_ids_list = self.processor.apply_chat_template(
+                convs_user_only, tokenize=True, add_generation_prompt=True
+            )
+            if isinstance(prompt_token_ids_list[0], int):
+                prompt_token_ids_list = [prompt_token_ids_list]
+
+            # 2) 构造包含assistant回复的完整对话
+            convs_full = []
+            for t, y, imgs in zip(texts, targets, images_per_sample):
+                content_user = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
+                convs_full.append([
+                    {"role": "user", "content": content_user},
+                    {"role": "assistant", "content": [{"type": "text", "text": y}]}
+                ])
+
+            full_texts = self.processor.apply_chat_template(
+                convs_full, tokenize=False, add_generation_prompt=False
+            )
+            inputs = self.processor(
+                text=full_texts, images=images_per_sample,
+                return_tensors="pt", padding=True, truncation=True, max_length=self.max_seq_len
+            )
+            # 构造labels：遮住prompt部分
+            input_ids = inputs["input_ids"]
+            labels = torch.full_like(input_ids, -100)
+            pad_id = self.processor.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.processor.tokenizer.eos_token_id
+            for i, pids in enumerate(prompt_token_ids_list):
+                prompt_len = len(pids)
+                row = input_ids[i]
+                non_pad = (row != pad_id).nonzero(as_tuple=False).squeeze(-1)
+                if non_pad.numel() == 0:
+                    continue
+                last_valid = int(non_pad[-1])
+                start = min(prompt_len, last_valid + 1)
+                labels[i, start:last_valid + 1] = row[start:last_valid + 1]
+            inputs["labels"] = labels
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(self.device)
+            return inputs
+
+    def generate(self, images, texts, max_length: int = 100, temperature: float = 0.7, do_sample: bool = True):
+        """生成式推理，支持原生多图输入"""
+        self.model.eval()
+        # 构造用户轮对话模板（多图）
+        if isinstance(texts, str):
+            texts = [texts]
+        images_per_sample = self._ensure_pil_per_sample(images)
+        B = len(images_per_sample)
+        if len(texts) == 1 and B > 1:
+            texts = [texts[0] for _ in range(B)]
+        if len(texts) != B:
+            raise ValueError(f"Texts and images batch size mismatch: {len(texts)} vs {B}")
+
+        convs_user_only = []
+        for t, imgs in zip(texts, images_per_sample):
+            content = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
+            convs_user_only.append([{ "role": "user", "content": content }])
+
+        prompt_texts = self.processor.apply_chat_template(
+            convs_user_only, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(
+            text=prompt_texts, images=images_per_sample,
+            return_tensors="pt", padding=True, truncation=True, max_length=self.max_seq_len
+        )
+        for k, v in inputs.items():
             if isinstance(v, torch.Tensor):
-                inputs[k] = v.to(device)
-        return inputs
-
-    def _compute_fused(self, images, texts) -> torch.Tensor:
-        device = self.device
-        inputs = self._prepare_inputs(images, texts, device)
-        # 使用新的 autocast API（替换未来弃用的 torch.cuda.amp.autocast）
-        with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
-            outputs = self.backbone(**inputs, output_hidden_states=True, return_dict=True)
-        hidden_states = getattr(outputs, "hidden_states", None)
-        last_hidden = None
-        if hidden_states is not None and isinstance(hidden_states, (list, tuple)) and len(hidden_states) > 0:
-            last_hidden = hidden_states[-1]  # [B, L, H]
-        else:
-            last_hidden = getattr(outputs, "last_hidden_state", None)
-        if last_hidden is None:
-            raise RuntimeError("Backbone did not return hidden states. Ensure trust_remote_code=True and correct processor/model pairing.")
-        # 简单均值池化作为融合表示
-        fused = last_hidden.mean(dim=1)  # [B, H]
-        return fused
-
-    def get_fused_features(self, images, texts):
+                inputs[k] = v.to(self.device)
+        
         with torch.no_grad():
-            return self._compute_fused(images, texts)
+            generated_ids = self.model.generate(
+                **inputs,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                pad_token_id=self.processor.tokenizer.eos_token_id
+            )
+        
+        # 解码生成的文本（去除输入部分，按每条样本的prompt长度切分更稳妥）
+        prompt_token_ids_list = self.processor.apply_chat_template(
+            convs_user_only, tokenize=True, add_generation_prompt=True
+        )
+        if isinstance(prompt_token_ids_list[0], int):
+            prompt_token_ids_list = [prompt_token_ids_list]
+        decoded = []
+        for i in range(generated_ids.size(0)):
+            start = len(prompt_token_ids_list[i])
+            text = self.processor.tokenizer.decode(
+                generated_ids[i, start:], skip_special_tokens=True
+            )
+            decoded.append(text)
+        return decoded
+
+    def compute_nll(self, images, texts, targets):
+        """计算给定target的负对数似然，用于KGA知识差距计算"""
+        self.model.eval()
+        inputs = self._prepare_inputs(images, texts, targets)
+        
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            loss = outputs.loss  # 已经是negative log likelihood
+        
+        return loss
+
+    def forward(self, images, texts, targets=None):
+        """
+        前向传播，返回包含logits的对象以兼容旧接口
+        如果提供targets，计算训练损失
+        """
+        inputs = self._prepare_inputs(images, texts, targets)
+        outputs = self.model(**inputs)
+        
+        # 兼容旧接口：返回包含logits的SimpleNamespace对象
+        result = SimpleNamespace(
+            logits=outputs.logits,
+            loss=outputs.loss if targets is not None else None
+        )
+        
+        return result
+
+    def get_hidden_states(self, images, texts):
+        """获取模型隐藏状态，用于MIA等评估"""
+        inputs = self._prepare_inputs(images, texts)
+        
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+            # 返回最后一层的隐藏状态的平均池化
+            last_hidden = outputs.hidden_states[-1]
+            pooled = last_hidden.mean(dim=1)  # [B, H]
+        
+        return pooled
+
+    # 为兼容性保留的别名方法
+    def get_fused_features(self, images, texts):
+        """兼容旧接口：获取融合特征"""
+        return self.get_hidden_states(images, texts)
 
     def forward_teacher(self, images, texts):
-        fused = self._compute_fused(images, texts)
-        logits = self.classifier(fused)  # 教师：不经过遗忘层
-        return SimpleNamespace(logits=logits)
-
-    def forward(self, images, texts):
-        fused = self._compute_fused(images, texts)
-        filtered = self.unlearning_layer(fused)
-        logits = self.classifier(filtered)
-        return SimpleNamespace(logits=logits)
+        """兼容旧接口：教师模型前向传播（等同于普通前向传播）"""
+        return self.forward(images, texts)

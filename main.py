@@ -1,40 +1,37 @@
 from data.load_medmnist import prepare_datasets
-from model.model_wrapper import QwenVLWithUnlearning
-from train.trainer import EULTrainer
-from eval import utility_eval, forgetting_eval, mia_eval
-from collections import Counter
+from model.model_wrapper import GenerativeQwenVLModel
+from train.trainer import KGATrainer
+from eval import kga_eval
 from config import config
-
+import torch
+import logging
+from utils.log_config import setup_logging
 
 def main():
-    # 1. 数据
-    retain_data, forget_data, val_data = prepare_datasets()
+    setup_logging()  # 初始化一次，之后全局生效
+    logger = logging.getLogger(__name__)
+    logger.info("程序启动中...")
 
-    # 自动探测类别数与分布
-    all_answers = [d["answer"] for d in retain_data] + [d["answer"] for d in forget_data] + [d["answer"] for d in val_data]
-    label_set = sorted(set(all_answers))
-    # 优先使用配置中的 num_classes，否则自动探测
-    num_classes = config.model.num_classes if config.model.num_classes is not None else ((max(label_set) + 1) if label_set else 1)
-    print(f"[INFO] Detected labels: {label_set}, num_classes={num_classes}")
+    # 1. 数据：生成式image-text-to-text，并包含 Dn  外部集
+    retain_data, forget_data, dn_data, val_data = prepare_datasets()
 
-    def print_dist(name, data):
-        c = Counter(d["answer"] for d in data)
-        c = dict(sorted(c.items()))
-        print(f"[INFO] {name}: size={len(data)} label_dist={c}")
+    # 2. 模型：以 AD 权重初始化 A*（若提供checkpoint）
+    A_star = GenerativeQwenVLModel(model_name=config.model.model_name, use_fast=config.model.use_fast)
+    if config.kga.ad_checkpoint:
+        try:
+            state = torch.load(config.kga.ad_checkpoint, map_location=A_star.device)
+            A_star.load_state_dict(state)
+            print(f"[INFO] A* initialized from AD checkpoint: {config.kga.ad_checkpoint}")
+        except Exception as e:
+            print(f"[WARN] Failed to load AD checkpoint for A*: {e}")
 
-    print_dist("retain_data", retain_data)
-    print_dist("forget_data", forget_data)
-    print_dist("val_data", val_data)
-
-    # 2. 模型（从配置读取参数）
-    model = QwenVLWithUnlearning(model_name=config.model.model_name, num_classes=num_classes, use_fast=config.model.use_fast)
-
-    # 3. 训练（从配置读取参数）
-    trainer = EULTrainer(
-        model,
-        retain_data,
-        forget_data,
-        val_data,
+    # 3. 训练：KGA
+    trainer = KGATrainer(
+        A_star=A_star,
+        retain_data=retain_data,
+        forget_data=forget_data,
+        dn_data=dn_data,
+        val_data=val_data,
         lr=config.train.lr,
         batch_size=config.train.batch_size,
         log_interval=config.train.log_interval,
@@ -42,11 +39,22 @@ def main():
     )
     trainer.train(epochs=config.train.epochs)
 
-    # 4. 评估（采样子集大小从配置读取）
-    k = config.eval.sample_size
-    utility_eval.evaluate_utility(model, val_data[:k])
-    forgetting_eval.evaluate_forgetting(model, forget_data[:k])
-    mia_eval.member_inference_attack(model, retain_data[:k], forget_data[:k])
+    # 4. 评估：KGA指标（知识差距对齐 + 性能保持）
+    k = int(config.eval.sample_size)
+    report = kga_eval.evaluate(
+        A_star=A_star,
+        retain_data=retain_data[:k],
+        forget_data=forget_data[:k],
+        dn_data=dn_data[:k],
+        val_data=val_data[:k],
+        AD=trainer.AD,
+        Af=trainer.Af,
+        An=trainer.An,
+    )
+
+    print("=" * 60)
+    for k_name, v in report.items():
+        print(f"{k_name}: {v}")
 
 
 if __name__ == "__main__":
