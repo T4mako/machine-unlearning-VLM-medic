@@ -6,19 +6,15 @@ from io import BytesIO
 from PIL import Image as PILImage
 from config import config
 import logging
-# Prefer Hugging Face datasets to load PubMedVision
 from datasets import load_dataset
 try:
     from datasets import load_from_disk
 except Exception:
     load_from_disk = None
-
-# Optional: use hf_hub_download to resolve relative paths inside the dataset repo
 try:
     from huggingface_hub import hf_hub_download
 except Exception:
     hf_hub_download = None
-# Also optionally import snapshot_download to fetch entire repo locally
 try:
     from huggingface_hub import snapshot_download
 except Exception:
@@ -212,13 +208,11 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     skipped_no_pil_all = 0
     skipped_no_conv = 0
     for ex in dset:
-        logging.info("ex: {}".format(ex))
         total_seen += 1
         logging.info("total_seen: {}".format(total_seen))
         modality = ex.get("modality")
         if modality is None or (isinstance(modality, str) and modality.strip() == ""):
             skipped_no_modality += 1
-            logging.info("no modality")
             continue
         images = ex.get("image")
         # 兼容单图场景：字符串/字典则转为列表
@@ -263,6 +257,7 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
             "human": human_text,
             "gpt": gpt_text,
         })
+        logging.info("records length: {}".format(len(records)))
 
         # 调试加速：达到上限即停止收集
         if debug_limit > 0 and len(records) >= debug_limit:
@@ -276,8 +271,8 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
         raise RuntimeError("No valid samples with conversations loaded from PubMedVision.")
 
     avg_imgs = sum(len(r["image"]) for r in records) / max(len(records), 1)
-    print(f"[INFO][load_medmnist] Scan done: seen={total_seen}, kept={len(records)}, avg_imgs_per_sample={avg_imgs:.2f}")
-    print(f"[INFO][load_medmnist] Skipped summary | no_modality={skipped_no_modality}, no_images={skipped_no_images}, no_pil={skipped_no_pil_all}, no_conv={skipped_no_conv}")
+    logging.info(f"Scan done: seen={total_seen}, kept={len(records)}, avg_imgs_per_sample={avg_imgs:.2f}")
+    logging.info(f"Skipped summary | no_modality={skipped_no_modality}, no_images={skipped_no_images}, no_pil={skipped_no_pil_all}, no_conv={skipped_no_conv}")
 
     # 3) 模态到标签
     modalities = sorted({r["modality"] for r in records})
@@ -287,8 +282,8 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     for r in records:
         m = r["modality"]
         mod_counts[m] = mod_counts.get(m, 0) + 1
-    print(f"[INFO][load_medmnist] Modalities discovered: {len(modalities)} -> {modalities}")
-    print(f"[INFO][load_medmnist] Samples per modality: {mod_counts}")
+    logging.info(f"Modalities discovered: {len(modalities)} -> {modalities}")
+    logging.info(f"Samples per modality: {mod_counts}")
 
     # 4) 组装 items
     items: List[Dict] = []
@@ -308,22 +303,24 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     n_val = max(1, int(0.1 * n_total))
     val_data = items[:n_val]
     train_pool = items[n_val:]
-    print(f"[INFO][load_medmnist] Total items={n_total} | val={len(val_data)} | train_pool={len(train_pool)}")
+    logging.info(f"Total items={n_total} | val={len(val_data)} | train_pool={len(train_pool)}")
 
     # 6) 根据 label==0 切分 retain/forget，并构建 Dn
     forget_label = 0
-    retain_dataset = [it for it in train_pool if it["label"] != forget_label]
+    # 模态标签非0的样本为保留集
+    retain_dataset = [it for it in train_pool if it["label"] != forget_label] 
+    # 模态标签为0的样本为遗忘集
     forget_dataset = [it for it in train_pool if it["label"] == forget_label]
-    print(f"[INFO][load_medmnist] Split by forget_label={forget_label}: retain={len(retain_dataset)}, forget={len(forget_dataset)}")
+    logging.info(f"Split by forget_label={forget_label}: retain={len(retain_dataset)}, forget={len(forget_dataset)}")
 
-    # Dn 子集
+    # Dn 子集（外部数据）
     n_dn = max(1, int(dn_ratio * len(retain_dataset))) if retain_dataset else 0
     random.seed(42)
     dn_dataset = random.sample(retain_dataset, n_dn) if n_dn > 0 else []
-    print(f"[INFO][load_medmnist] Built Dn subset: n_dn={len(dn_dataset)} (ratio={dn_ratio}) from retain={len(retain_dataset)}")
+    logging.info(f"Built Dn subset: n_dn={len(dn_dataset)} (ratio={dn_ratio}) from retain={len(retain_dataset)}")
 
     # 保存到缓存（包含PIL对象）
     _save_splits_to_cache(retain_dataset, forget_dataset, dn_dataset, val_data, dn_ratio, debug_limit)
 
-    print(f"[INFO][load_medmnist] Final sizes -> Dr={len(retain_dataset)}, Df={len(forget_dataset)}, Dn={len(dn_dataset)}, Val={len(val_data)}")
+    logging.info(f"Final sizes -> Dr={len(retain_dataset)}, Df={len(forget_dataset)}, Dn={len(dn_dataset)}, Val={len(val_data)}")
     return retain_dataset, forget_dataset, dn_dataset, val_data

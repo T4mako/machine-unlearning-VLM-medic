@@ -10,7 +10,7 @@ import math
 import torch
 from typing import List, Dict
 
-from data.load_medmnist import prepare_datasets
+from data.load_PubMedVision import prepare_datasets
 from model.model_wrapper import GenerativeQwenVLModel as QwenVLWithUnlearning
 from config import config
 

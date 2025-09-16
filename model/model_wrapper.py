@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from typing import List, Union, Optional
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 import torch.nn.functional as F
+from config import config
+from model.unlearning_layer import UnlearningLayer
 
 try:
     from torchvision.transforms.functional import to_pil_image
@@ -13,18 +15,19 @@ except Exception:
 
 class GenerativeQwenVLModel(nn.Module):
     """
-    生成式Qwen2.5-VL模型，用于KGA框架的image-text-to-text任务。
+    HuatuoGPT-Vision-7B 基于 Qwen2-7B 进行训练，使用 LLaVA-v1.5 架构
+    用于KGA框架的image-text-to-text任务。
     支持：
     1. generate: 生成式推理
     2. compute_nll: 计算给定target的负对数似然（用于KGA知识差距计算）
     3. forward: 返回包含logits的对象以兼容旧接口
     """
 
-    def __init__(self, model_name: str = "FreedomIntelligence/HuatuoGPT-Vision-7B-Qwen2.5VL", use_fast: bool = False):
+    def __init__(self, model_name: str = config.model.model_name, use_fast: bool = config.model.use_fast):
         super().__init__()
         # 设备选择：优先使用GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.max_seq_len = 2048  # 针对对话式长文本设置上下文上限
+        self.max_seq_len = config.model.max_seq_len  # 针对对话式长文本设置上下文上限
         
         # 加载生成式多模态模型与处理器
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -38,6 +41,29 @@ class GenerativeQwenVLModel(nn.Module):
             trust_remote_code=True, 
             use_fast=use_fast
         )
+
+        # ===== 遗忘层 =====
+        self.hidden_size = int(getattr(self.model.config, "hidden_size", getattr(getattr(self.model, "config", object()), "hidden_size", 0)))
+        self.unl_enabled: bool = bool(getattr(config.model, "enable_unl", False))
+        self.unl_hidden_dim: int = int(getattr(config.model, "unl_hidden_dim", 128))
+        self.unlearning_layer: Optional[UnlearningLayer] = None
+        if self.unl_enabled and self.hidden_size > 0:
+            self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+
+    def enable_unlearning(self, enabled: bool = True):
+        self.unl_enabled = bool(enabled)
+
+    def get_unlearning_parameters(self):
+        return list(self.unlearning_layer.parameters()) if (self.unlearning_layer is not None) else []
+
+    def _apply_unl(self, last_hidden: torch.Tensor) -> torch.Tensor:
+        """对最后一层隐藏状态应用遗忘层。last_hidden: [B, T, H]"""
+        if (self.unl_enabled is False) or (self.unlearning_layer is None):
+            return last_hidden
+        B, T, H = last_hidden.shape
+        x = last_hidden.reshape(-1, H)
+        y = self.unlearning_layer(x)
+        return y.reshape(B, T, H)
 
     def _ensure_pil_list(self, images: Union[torch.Tensor, "PIL.Image.Image", List]) -> List:
         """将输入统一为 PIL 图像列表，方便交给 AutoProcessor 处理。"""
@@ -224,6 +250,7 @@ class GenerativeQwenVLModel(nn.Module):
                 inputs[k] = v.to(self.device)
         
         with torch.no_grad():
+            # 生成阶段不应用遗忘层，保持原生生成行为（如有需要可开启）
             generated_ids = self.model.generate(
                 **inputs,
                 max_length=max_length,
@@ -248,31 +275,63 @@ class GenerativeQwenVLModel(nn.Module):
         return decoded
 
     def compute_nll(self, images, texts, targets):
-        """计算给定target的负对数似然，用于KGA知识差距计算"""
+        """计算给定target的负对数似然，用于KGA/EUL知识差距计算。若开启遗忘层，则基于遗忘层后的logits计算。"""
         self.model.eval()
         inputs = self._prepare_inputs(images, texts, targets)
         
         with torch.no_grad():
-            outputs = self.model(**inputs)
-            loss = outputs.loss  # 已经是negative log likelihood
+            if self.unl_enabled and (self.unlearning_layer is not None):
+                outputs = self.model(**inputs, output_hidden_states=True)
+                last_hidden = outputs.hidden_states[-1]
+                last_hidden = self._apply_unl(last_hidden)
+                logits = self.model.lm_head(last_hidden)
+                labels = inputs["labels"]
+                # 与HF一致：shift一位
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100
+                )
+            else:
+                outputs = self.model(**inputs)
+                loss = outputs.loss  # 已经是NLL
         
         return loss
 
     def forward(self, images, texts, targets=None):
         """
         前向传播，返回包含logits的对象以兼容旧接口
-        如果提供targets，计算训练损失
+        如果提供targets，计算训练损失；若开启遗忘层，则基于遗忘层后的logits与labels计算loss。
         """
         inputs = self._prepare_inputs(images, texts, targets)
-        outputs = self.model(**inputs)
         
-        # 兼容旧接口：返回包含logits的SimpleNamespace对象
-        result = SimpleNamespace(
-            logits=outputs.logits,
-            loss=outputs.loss if targets is not None else None
-        )
-        
-        return result
+        if (targets is not None) and self.unl_enabled and (self.unlearning_layer is not None):
+            outputs = self.model(**inputs, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1]
+            last_hidden = self._apply_unl(last_hidden)
+            logits = self.model.lm_head(last_hidden)
+            labels = inputs["labels"]
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100
+            )
+            result = SimpleNamespace(
+                logits=logits,
+                loss=loss
+            )
+            return result
+        else:
+            outputs = self.model(**inputs)
+            result = SimpleNamespace(
+                logits=outputs.logits,
+                loss=outputs.loss if targets is not None else None
+            )
+            return result
 
     def get_hidden_states(self, images, texts):
         """获取模型隐藏状态，用于MIA等评估"""

@@ -1,4 +1,4 @@
-from data.load_medmnist import prepare_datasets
+from data.load_PubMedVision import prepare_datasets
 from model.model_wrapper import GenerativeQwenVLModel
 from train.trainer import KGATrainer
 from eval import kga_eval
@@ -9,8 +9,7 @@ from utils.log_config import setup_logging
 
 def main():
     setup_logging()  # 初始化一次，之后全局生效
-    logger = logging.getLogger(__name__)
-    logger.info("程序启动中...")
+    logging.info("程序启动中...")
 
     # 1. 数据：生成式image-text-to-text，并包含 Dn  外部集
     retain_data, forget_data, dn_data, val_data = prepare_datasets()
@@ -21,9 +20,9 @@ def main():
         try:
             state = torch.load(config.kga.ad_checkpoint, map_location=A_star.device)
             A_star.load_state_dict(state)
-            print(f"[INFO] A* initialized from AD checkpoint: {config.kga.ad_checkpoint}")
+            logging.info(f"[INFO] A* initialized from AD checkpoint: {config.kga.ad_checkpoint}")
         except Exception as e:
-            print(f"[WARN] Failed to load AD checkpoint for A*: {e}")
+            logging.warning(f"[WARN] Failed to load AD checkpoint for A*: {e}")
 
     # 3. 训练：KGA
     trainer = KGATrainer(
