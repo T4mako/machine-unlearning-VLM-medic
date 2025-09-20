@@ -1,8 +1,10 @@
+import logging
+
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
 from typing import List, Union, Optional
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoModelForVision2Seq, AutoProcessor, AutoModelForImageTextToText
 import torch.nn.functional as F
 from config import config
 from model.unlearning_layer import UnlearningLayer
@@ -29,13 +31,17 @@ class GenerativeQwenVLModel(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.max_seq_len = config.model.max_seq_len  # 针对对话式长文本设置上下文上限
         
-        # 加载生成式多模态模型与处理器
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+        # 加载生成式多模态模型与处理器（AutoModelForVision2Seq 自动匹配 qwen2_vl / qwen2_5_vl）
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        self.model = AutoModelForImageTextToText.from_pretrained(
             model_name, 
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        ).to(self.device)
-        
+            dtype=torch.bfloat16,
+            device_map="auto",
+            offload_folder="offload"
+        )
+        logging.info("模型已加载")
+
         self.processor = AutoProcessor.from_pretrained(
             model_name, 
             trust_remote_code=True, 
@@ -43,6 +49,7 @@ class GenerativeQwenVLModel(nn.Module):
         )
 
         # ===== 遗忘层 =====
+        logging.info("初始化遗忘层...")
         self.hidden_size = int(getattr(self.model.config, "hidden_size", getattr(getattr(self.model, "config", object()), "hidden_size", 0)))
         self.unl_enabled: bool = bool(getattr(config.model, "enable_unl", False))
         self.unl_hidden_dim: int = int(getattr(config.model, "unl_hidden_dim", 128))
@@ -284,7 +291,8 @@ class GenerativeQwenVLModel(nn.Module):
                 outputs = self.model(**inputs, output_hidden_states=True)
                 last_hidden = outputs.hidden_states[-1]
                 last_hidden = self._apply_unl(last_hidden)
-                logits = self.model.lm_head(last_hidden)
+                lm_head = self.model.get_output_embeddings()
+                logits = lm_head(last_hidden)
                 labels = inputs["labels"]
                 # 与HF一致：shift一位
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -311,7 +319,8 @@ class GenerativeQwenVLModel(nn.Module):
             outputs = self.model(**inputs, output_hidden_states=True)
             last_hidden = outputs.hidden_states[-1]
             last_hidden = self._apply_unl(last_hidden)
-            logits = self.model.lm_head(last_hidden)
+            lm_head = self.model.get_output_embeddings()
+            logits = lm_head(last_hidden)
             labels = inputs["labels"]
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

@@ -166,7 +166,7 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
         try:
             ds.save_to_disk('./data/PubMedVision_Alignment_VQA')
         except Exception as se:
-            print(f"[WARN][load_medmnist] save_to_disk failed: {se}")
+            logging.info(f"save_to_disk failed: {se}")
 
     # 为后续相对路径图片解析设置本地根目录优先级
     global _DATASET_LOCAL_ROOT
