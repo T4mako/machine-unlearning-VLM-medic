@@ -7,6 +7,7 @@ import torch
 import logging
 from utils.log_config import setup_logging
 import argparse
+import os
 
 
 def main():
@@ -14,7 +15,7 @@ def main():
     logging.info("程序启动中...")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['full', 'train_main', 'eval_teacher', 'eval_reference'], default='full', help='分批运行模式：full=原逻辑；train_main=仅训练主模型；eval_teacher=仅教师相关评估；eval_reference=仅参考模型相关评估。')
+    parser.add_argument('--mode', choices=['full', 'train_main', 'eval_teacher', 'eval_reference', 'precompute_gap', 'train_with_af'], default='full', help='分批运行模式：full=原逻辑；train_main=仅训练主模型；eval_teacher=仅教师相关评估；eval_reference=仅参考模型相关评估；precompute_gap=仅加载AD与An计算baseline_gap；train_with_af=仅加载Af进行KGA训练。')
     parser.add_argument('--baseline_gap', type=float, default=None, help='可选：覆盖 baseline_gap（当分批运行无法同时加载AD/An时可用）。')
     args, _ = parser.parse_known_args()
 
@@ -67,7 +68,7 @@ def main():
         )
 
     elif args.mode == 'train_main':
-        # 仅训练主模型：不加载教师/基线模型，必要时用 baseline_gap 覆盖
+        # 仅训练主模型：不加载教师/基线模型，必要时用 baseline_gap 覆盖（仅当 objective 为 eul 时推荐此模式）
         trainer = KGATrainer(
             A_star=A_star,
             retain_data=retain_data,
@@ -103,7 +104,6 @@ def main():
             load_An=False,
             baseline_gap_override=args.baseline_gap,
         )
-        # 可选：此模式下只跑 teacher 相关评估逻辑（此处简单返回空报告）
         report = {}
 
     elif args.mode == 'eval_reference':
@@ -123,7 +123,56 @@ def main():
             load_An=True,
             baseline_gap_override=args.baseline_gap,
         )
-        # 可选：此模式下可用于预计算 baseline_gap（AD/An 不全时需传入 baseline_gap）
+        report = {}
+
+    elif args.mode == 'precompute_gap':
+        # 仅加载 AD 与 An，用于预计算 baseline_gap，避免一次性驻留 Af
+        trainer = KGATrainer(
+            A_star=A_star,
+            retain_data=retain_data,
+            forget_data=forget_data,
+            dn_data=dn_data,
+            val_data=val_data,
+            lr=config.train.lr,
+            batch_size=config.train.batch_size,
+            log_interval=config.train.log_interval,
+            debug_limit=config.train.debug_limit,
+            load_AD=True,
+            load_Af=False,
+            load_An=True,
+            baseline_gap_override=None,
+        )
+        # baseline_gap 已在 __init__ 中计算（若 AD 和 An 同时加载）；这里保存下来
+        os.makedirs('logs', exist_ok=True)
+        gap_path = os.path.join('logs', 'baseline_gap.txt')
+        try:
+            with open(gap_path, 'w', encoding='utf-8') as f:
+                f.write(str(trainer.baseline_gap))
+            logging.info(f"[KGA] baseline_gap saved to {gap_path}: {trainer.baseline_gap:.6f}")
+        except Exception as e:
+            logging.warning(f"[WARN] Failed to save baseline_gap: {e}")
+        report = {}
+
+    elif args.mode == 'train_with_af':
+        # 仅加载 Af，用于 KGA 训练；需提供 baseline_gap（来自 precompute_gap 阶段）
+        if args.baseline_gap is None:
+            logging.warning("[KGA] --baseline_gap 未提供，将以0代替，训练可进行但不建议。建议先运行 --mode precompute_gap 后再传入该值。")
+        trainer = KGATrainer(
+            A_star=A_star,
+            retain_data=retain_data,
+            forget_data=forget_data,
+            dn_data=dn_data,
+            val_data=val_data,
+            lr=config.train.lr,
+            batch_size=config.train.batch_size,
+            log_interval=config.train.log_interval,
+            debug_limit=config.train.debug_limit,
+            load_AD=False,
+            load_Af=True,
+            load_An=False,
+            baseline_gap_override=args.baseline_gap,
+        )
+        trainer.train(epochs=config.train.epochs)
         report = {}
 
     print("=" * 60)
