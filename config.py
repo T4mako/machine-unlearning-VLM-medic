@@ -9,7 +9,7 @@ class ModelConfig:
     # use_fast: bool = False  # 重复定义会导致 dataclass 报错；保留下方的 use_fast=True 作为默认
     temperature: float = 0.7  # 生成温度（分类任务暂不使用，保留做推理/生成时用）
     num_classes: Optional[int] = None  # 若为 None，则自动探测数据集类别数
-    max_seq_len: int = 512  # 最大序列长度
+    max_seq_len: int = 2048  # 最大序列长度
     use_fast: bool = True  # 是否使用 fast 版处理器
     # === 新增：遗忘层相关 ===
     enable_unl: bool = True           # 是否启用遗忘层（UnlearningLayer）
