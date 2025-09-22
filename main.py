@@ -204,13 +204,13 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
 
 def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, student_model_name: str = None, student_init_ckpt: str = None):
     """仅加载一次学生模型，使用磁盘伪标签进行监督训练并保存checkpoint。"""
+    logging.info(f"[KD] 加载学生模型: {student_model_name or 'ibm-granite/granite-docling-258M'}")
     payload = torch.load(labels_path)
     kd_prompts = payload.get("prompts", [])
     kd_labels = payload.get("labels", [])
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
-    # 强制只用多模态主模型
-    model_name_to_use = config.model.model_name
+    model_name_to_use = student_model_name
     student = GenerativeQwenVLModel(model_name=model_name_to_use, use_fast=config.model.use_fast)
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
@@ -323,6 +323,7 @@ def main():
         dataset = dn_data if role == 'an' else forget_data
         labels_path = os.path.join('logs', f'{role}_kd_labels.pt')
         out_ckpt = (config.kd.an_out_ckpt if role == 'an' else config.kd.af_out_ckpt)
+        logging.info(f"[KD] {role.upper()} 加载学生模型: {'ibm-granite/granite-docling-258M'}")
         train_student_from_kd_labels(
             dataset=dataset,
             labels_path=labels_path,
