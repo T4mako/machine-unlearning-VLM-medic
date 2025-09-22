@@ -1,3 +1,4 @@
+from venv import logger
 from data.load_PubMedVision import prepare_datasets
 from model.model_wrapper import GenerativeQwenVLModel
 from train.trainer import KGATrainer
@@ -162,7 +163,11 @@ def precompute_af_nll_singleton(model_name: str, ckpt_af: str, forget_data, out_
 def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_ckpt: str, max_len: int, temperature: float):
     """仅加载一次教师模型，为给定数据集生成伪标签并保存到磁盘。"""
     logging.info(f"[KD] 准备伪标签 -> {out_path}")
+
+    # 加载教师模型
+    logging.info(f"[KD] 加载教师模型: {teacher_model_name}")
     teacher = GenerativeQwenVLModel(model_name=teacher_model_name, use_fast=config.model.use_fast)
+
     try:
         teacher.enable_unlearning(False)
     except Exception:
@@ -179,6 +184,7 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
     all_labels = []
     for images, texts, _ in _iter_batches(dataset, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
         gens = teacher.generate(images, texts, max_length=max_len, temperature=temperature)
+        logging.info(f"[KD] 生成伪标签: {gens[:2]}")
         all_prompts.extend(texts)
         all_labels.extend(gens)
     # 保存
@@ -208,9 +214,11 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
     model_name_to_use = student_model_name or config.kd.student_model_name or config.model.model_name
+    logging.info(f"[KD] 训练学生模型: {model_name_to_use}")
     student = GenerativeQwenVLModel(model_name=model_name_to_use, use_fast=config.model.use_fast)
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
+        logging.info(f"[KD] An/Af 不使用遗忘层")
     except Exception:
         pass
     if student_init_ckpt:
@@ -307,6 +315,7 @@ def main():
             max_len=int(config.kd.gen_max_len),
             temperature=float(config.kd.gen_temperature)
         )
+        logging.info(f"[KD] {role.upper()} 伪标签已生成 -> {labels_path}")
         train_student_from_kd_labels(
             dataset=dataset,
             labels_path=labels_path,
