@@ -212,13 +212,14 @@ class GenerativeQwenVLModel(nn.Module):
         # 文本-only 路径
         if self.text_only:
             return self._prepare_inputs_text_only(texts, targets)
-
+        logging.info(f"[KD] 文字样本数 {len(texts)} | 图片样本数 {len(images)} | 目标数 {len(targets)}")
         # texts 统一成列表
         if isinstance(texts, str):
             texts = [texts]
         # 图像规范化为“每条样本的图像列表”的批格式
         images_per_sample = self._ensure_pil_per_sample(images)  # List[List[PIL]]
         B = len(images_per_sample)
+        logging.info(f"[KD] B样本数 {B}")
 
         # 文本广播/对齐
         if len(texts) == 1 and B > 1:
@@ -231,7 +232,7 @@ class GenerativeQwenVLModel(nn.Module):
         for t, imgs in zip(texts, images_per_sample):
             content = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
             convs_user_only.append([{ "role": "user", "content": content }])
-
+        logging.info(f"[convs_user_only] {convs_user_only}")
         if targets is None:
             # 推理：只构造用户轮，添加generation prompt
             prompt_texts = self.processor.apply_chat_template(
@@ -253,8 +254,9 @@ class GenerativeQwenVLModel(nn.Module):
                 targets = [targets[0] for _ in range(B)]
             if len(targets) != B:
                 raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
-            logging.info(f"[KD] 训练批次 {n_batches} | 样本数 {B} | 目标数 {len(targets)}")
+            logging.info(f"[KD] B样本数 {B} | 目标数 {len(targets)}")
             # 1) 获取每条样本prompt的token长度（包含多图占位）
+            logging.info(f"convs_user_only {convs_user_only}")
             prompt_token_ids_list = self.processor.apply_chat_template(
                 convs_user_only, tokenize=True, add_generation_prompt=True
             )
