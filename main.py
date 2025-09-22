@@ -283,8 +283,8 @@ def main():
     # 4) precompute_af_nll: 预计算 Af 在 Df 的NLL缓存
     # 5) train_with_af: 使用缓存的 G 与 Af-NLL 训练 A*
 
-    parser.add_argument('--mode', choices=['distill_an', 'distill_af','precompute_gap', 'precompute_af_nll', 'train_with_af', ], default='precompute_gap',
-                        help='分批运行模式：precompute_gap=仅加载AD与An计算目标差距G；precompute_af_nll=仅加载Af预计算Df上的NLL缓存；train_with_af=仅加载A*并从缓存读取Af的NLL进行KGA训练；distill_an=离线KD训练An；distill_af=离线KD训练Af。')
+    # parser.add_argument('--mode', choices=['distill_an', 'distill_af','precompute_gap', 'precompute_af_nll', 'train_with_af', ], default='precompute_gap',
+    #                     help='分批运行模式：precompute_gap=仅加载AD与An计算目标差距G；precompute_af_nll=仅加载Af预计算Df上的NLL缓存；train_with_af=仅加载A*并从缓存读取Af的NLL进行KGA训练；distill_an=离线KD训练An；distill_af=离线KD训练Af。')
     parser.add_argument('--mode', choices=[
         'distill_an_labels', 'distill_an_train',
         'distill_af_labels', 'distill_af_train',
