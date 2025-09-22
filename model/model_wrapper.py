@@ -253,7 +253,7 @@ class GenerativeQwenVLModel(nn.Module):
                 targets = [targets[0] for _ in range(B)]
             if len(targets) != B:
                 raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
-
+            logging.info(f"[KD] 训练批次 {n_batches} | 样本数 {B} | 目标数 {len(targets)}")
             # 1) 获取每条样本prompt的token长度（包含多图占位）
             prompt_token_ids_list = self.processor.apply_chat_template(
                 convs_user_only, tokenize=True, add_generation_prompt=True

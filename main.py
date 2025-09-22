@@ -249,6 +249,7 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
             texts = [x["text"] for x in batch]
             targets = _get_kd_target_slice(i, min(i + B, n_items))
             assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
+            logging.info(f"[KD] 训练批次 {n_batches} | 样本数 {len(images)} | 目标数 {len(targets)}")
             loss = student.loss_on_batch(images, texts, targets)
             optim.zero_grad(set_to_none=True)
             loss.backward()
