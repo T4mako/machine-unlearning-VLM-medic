@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from config import config
 from model.unlearning_layer import UnlearningLayer
 
+# 新增：文本模型支持
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception:
+    AutoModelForCausalLM = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+
 try:
     from torchvision.transforms.functional import to_pil_image
 except Exception:
@@ -23,6 +30,9 @@ class GenerativeQwenVLModel(nn.Module):
     1. generate: 生成式推理
     2. compute_nll: 计算给定target的负对数似然（用于KGA知识差距计算）
     3. forward: 返回包含logits的对象以兼容旧接口
+    另外：
+    - 支持文本-only 小模型回退（如 ibm-granite/granite-docling-258M），自动忽略图像分支。
+    - 提供 loss_on_batch 用于蒸馏训练（带梯度）。
     """
 
     def __init__(self, model_name: str = config.model.model_name, use_fast: bool = config.model.use_fast):
@@ -30,23 +40,47 @@ class GenerativeQwenVLModel(nn.Module):
         # 设备选择：优先使用GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.max_seq_len = config.model.max_seq_len  # 针对对话式长文本设置上下文上限
-        
-        # 加载生成式多模态模型与处理器（AutoModelForVision2Seq 自动匹配 qwen2_vl / qwen2_5_vl）
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_name, 
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
-            device_map="auto",
-            offload_folder="offload"
-        )
-        logging.info("模型已加载")
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, 
-            trust_remote_code=True, 
-            use_fast=use_fast
-        )
+        self.text_only: bool = False
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+        # 优先加载多模态生成模型
+        self.model = None
+        self.processor = None
+        try:
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                device_map="auto",
+                offload_folder="offload"
+            )
+            self.processor = AutoProcessor.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                use_fast=use_fast
+            )
+            logging.info("模型已加载（多模态 ImageTextToText）")
+        except Exception as e:
+            # 回退：文本-only 模型
+            if AutoModelForCausalLM is None or AutoTokenizer is None:
+                raise
+            logging.info(f"多模态加载失败，回退为文本-only模型: {e}")
+            self.text_only = True
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                device_map="auto",
+                offload_folder="offload",
+            )
+            # 文本-only 使用 tokenizer 作为processor占位
+            self.processor = AutoTokenizer.from_pretrained(
+                model_name,
+                use_fast=use_fast,
+                trust_remote_code=True,
+            )
+            logging.info("模型已加载（文本-only CausalLM）")
 
         # ===== 遗忘层 =====
         logging.info("初始化遗忘层...")
@@ -72,44 +106,76 @@ class GenerativeQwenVLModel(nn.Module):
         y = self.unlearning_layer(x)
         return y.reshape(B, T, H)
 
-    def _ensure_pil_list(self, images: Union[torch.Tensor, "PIL.Image.Image", List]) -> List:
-        """将输入统一为 PIL 图像列表，方便交给 AutoProcessor 处理。"""
-        # 已是列表
-        if isinstance(images, list):
-            imgs = images
-        else:
-            imgs = [images]
+    # ===== 图像预处理保持不变（文本-only 时会忽略） =====
+    def _ensure_pil_list(self, x):
+        # 兼容已有调用
+        if isinstance(x, list):
+            return x
+        if to_pil_image and torch.is_tensor(x):
+            return [to_pil_image(x)]
+        return [x]
 
-        processed = []
-        for img in imgs:
-            if isinstance(img, torch.Tensor):
-                # 形状: C,H,W；需要转换为PIL
-                if to_pil_image is None:
-                    # 简单兜底：转到CPU并转numpy后构造PIL（避免强依赖torchvision）
-                    import numpy as np
-                    from PIL import Image
-                    t = img.detach().cpu()
-                    if t.dim() == 3 and t.size(0) in (1, 3):
-                        # C,H,W -> H,W,C
-                        arr = t.numpy()
-                        arr = (arr * 255.0).clip(0, 255).astype('uint8') if arr.max() <= 1.0 else arr.astype('uint8')
-                        if arr.shape[0] == 1:
-                            arr = np.repeat(arr, 3, axis=0)
-                        arr = arr.transpose(1, 2, 0)
-                        processed.append(Image.fromarray(arr))
-                    else:
-                        # 无法识别的形状，直接报错提示
-                        raise ValueError("Unsupported tensor image shape; expected CxHxW with C=1 or 3.")
+    # 新增：文本-only 输入准备
+    def _prepare_inputs_text_only(self, texts, targets: Optional[List[str]] = None):
+        if isinstance(texts, str):
+            texts = [texts]
+        B = len(texts)
+        tokenizer = self.processor  # type: ignore
+        if targets is None:
+            enc = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_len,
+            )
+            for k, v in enc.items():
+                if isinstance(v, torch.Tensor):
+                    enc[k] = v.to(self.device)
+            return enc
+        else:
+            if isinstance(targets, str):
+                targets = [targets]
+            if len(targets) == 1 and B > 1:
+                targets = [targets[0] for _ in range(B)]
+            if len(targets) != B:
+                raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
+            # 逐样本构建 input_ids 与 labels，遮住 prompt 部分
+            input_ids_list = []
+            labels_list = []
+            attn_list = []
+            for t, y in zip(texts, targets):
+                ids_prompt = tokenizer.encode(t, add_special_tokens=False)
+                # 在大多数CausalLM中，追加一个分隔符/空格更稳妥
+                ids_target = tokenizer.encode(y, add_special_tokens=False)
+                # 拼接，并在末尾追加 eos
+                eos_id = tokenizer.eos_token_id
+                if eos_id is not None:
+                    full = ids_prompt + ids_target + [eos_id]
                 else:
-                    # 使用 torchvision 的 to_pil_image
-                    t = img.detach().cpu()
-                    if t.dim() == 3 and t.size(0) == 1:
-                        t = t.repeat(3, 1, 1)  # 单通道扩展为3通道
-                    processed.append(to_pil_image(t))
-            else:
-                # 假设已是 PIL.Image 或可被 processor 接受的类型
-                processed.append(img)
-        return processed
+                    full = ids_prompt + ids_target
+                input_ids_list.append(torch.tensor(full, dtype=torch.long))
+                # labels：遮住 prompt 部分
+                labels = torch.tensor(full, dtype=torch.long)
+                labels[:len(ids_prompt)] = -100
+                labels_list.append(labels)
+                attn_list.append(torch.ones_like(labels, dtype=torch.long))
+            # pad 到同长
+            max_len = max(x.size(0) for x in input_ids_list)
+            def pad_to(x, val):
+                if x.size(0) == max_len:
+                    return x
+                pad = torch.full((max_len - x.size(0),), val, dtype=x.dtype)
+                return torch.cat([x, pad], dim=0)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
+            input_ids = torch.stack([pad_to(x, pad_id) for x in input_ids_list], dim=0)
+            labels = torch.stack([pad_to(x, -100) for x in labels_list], dim=0)
+            attention_mask = torch.stack([pad_to(x, 0) for x in attn_list], dim=0)
+            return {
+                "input_ids": input_ids.to(self.device),
+                "attention_mask": attention_mask.to(self.device),
+                "labels": labels.to(self.device),
+            }
 
     # 新增：将任意输入规格统一为“每条样本一个PIL列表”的批格式 List[List[PIL]]
     def _ensure_pil_per_sample(self, images) -> List[List]:
@@ -141,7 +207,12 @@ class GenerativeQwenVLModel(nn.Module):
     def _prepare_inputs(self, images, texts, targets: Optional[List[str]] = None):
         """准备模型输入；当提供targets时，构造labels与input_ids等长，并对prompt部分置-100。
         支持原生多图：images可以是 List[List[PIL]]（batch级），或 List[PIL]（单样本多图），或单图。
+        文本-only模型将忽略 images。
         """
+        # 文本-only 路径
+        if self.text_only:
+            return self._prepare_inputs_text_only(texts, targets)
+
         # texts 统一成列表
         if isinstance(texts, str):
             texts = [texts]
@@ -228,8 +299,34 @@ class GenerativeQwenVLModel(nn.Module):
             return inputs
 
     def generate(self, images, texts, max_length: int = 100, temperature: float = 0.7, do_sample: bool = True):
-        """生成式推理，支持原生多图输入"""
+        """生成式推理，支持原生多图输入；文本-only 模型忽略 images。"""
         self.model.eval()
+        if self.text_only:
+            if isinstance(texts, str):
+                texts = [texts]
+            tokenizer = self.processor  # type: ignore
+            enc = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_len,
+            )
+            for k, v in enc.items():
+                if isinstance(v, torch.Tensor):
+                    enc[k] = v.to(self.device)
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **enc,
+                    max_length=max_length,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            return decoded
+
+        # 多模态路径
         # 构造用户轮对话模板（多图）
         if isinstance(texts, str):
             texts = [texts]
@@ -287,6 +384,37 @@ class GenerativeQwenVLModel(nn.Module):
         inputs = self._prepare_inputs(images, texts, targets)
         
         with torch.no_grad():
+            if self.text_only:
+                outputs = self.model(**inputs)
+                loss = outputs.loss
+            else:
+                if self.unl_enabled and (self.unlearning_layer is not None):
+                    outputs = self.model(**inputs, output_hidden_states=True)
+                    last_hidden = outputs.hidden_states[-1]
+                    last_hidden = self._apply_unl(last_hidden)
+                    lm_head = self.model.get_output_embeddings()
+                    logits = lm_head(last_hidden)
+                    labels = inputs["labels"]
+                    # 与HF一致：shift一位
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100
+                    )
+                else:
+                    outputs = self.model(**inputs)
+                    loss = outputs.loss  # 已经是NLL
+        return loss
+
+    # 新增：训练用，返回带梯度的loss
+    def loss_on_batch(self, images, texts, targets):
+        inputs = self._prepare_inputs(images, texts, targets)
+        if self.text_only:
+            outputs = self.model(**inputs)
+            return outputs.loss
+        else:
             if self.unl_enabled and (self.unlearning_layer is not None):
                 outputs = self.model(**inputs, output_hidden_states=True)
                 last_hidden = outputs.hidden_states[-1]
@@ -294,7 +422,6 @@ class GenerativeQwenVLModel(nn.Module):
                 lm_head = self.model.get_output_embeddings()
                 logits = lm_head(last_hidden)
                 labels = inputs["labels"]
-                # 与HF一致：shift一位
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 loss = F.cross_entropy(
@@ -302,57 +429,10 @@ class GenerativeQwenVLModel(nn.Module):
                     shift_labels.view(-1),
                     ignore_index=-100
                 )
+                return loss
             else:
                 outputs = self.model(**inputs)
-                loss = outputs.loss  # 已经是NLL
-        
-        return loss
-
-    def forward(self, images, texts, targets=None):
-        """
-        前向传播，返回包含logits的对象以兼容旧接口
-        如果提供targets，计算训练损失；若开启遗忘层，则基于遗忘层后的logits与labels计算loss。
-        """
-        inputs = self._prepare_inputs(images, texts, targets)
-        
-        if (targets is not None) and self.unl_enabled and (self.unlearning_layer is not None):
-            outputs = self.model(**inputs, output_hidden_states=True)
-            last_hidden = outputs.hidden_states[-1]
-            last_hidden = self._apply_unl(last_hidden)
-            lm_head = self.model.get_output_embeddings()
-            logits = lm_head(last_hidden)
-            labels = inputs["labels"]
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100
-            )
-            result = SimpleNamespace(
-                logits=logits,
-                loss=loss
-            )
-            return result
-        else:
-            outputs = self.model(**inputs)
-            result = SimpleNamespace(
-                logits=outputs.logits,
-                loss=outputs.loss if targets is not None else None
-            )
-            return result
-
-    def get_hidden_states(self, images, texts):
-        """获取模型隐藏状态，用于MIA等评估"""
-        inputs = self._prepare_inputs(images, texts)
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs, output_hidden_states=True)
-            # 返回最后一层的隐藏状态的平均池化
-            last_hidden = outputs.hidden_states[-1]
-            pooled = last_hidden.mean(dim=1)  # [B, H]
-        
-        return pooled
+                return outputs.loss
 
     # 为兼容性保留的别名方法
     def get_fused_features(self, images, texts):
@@ -362,3 +442,12 @@ class GenerativeQwenVLModel(nn.Module):
     def forward_teacher(self, images, texts):
         """兼容旧接口：教师模型前向传播（等同于普通前向传播）"""
         return self.forward(images, texts)
+
+    def get_hidden_states(self, images, texts):
+        """获取模型隐藏状态，用于MIA等评估；文本-only 与多模态均返回最后一层平均池化。"""
+        inputs = self._prepare_inputs(images, texts)
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1]
+            pooled = last_hidden.mean(dim=1)  # [B, H]
+        return pooled

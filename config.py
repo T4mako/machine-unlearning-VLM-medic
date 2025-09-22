@@ -44,12 +44,27 @@ class KGAConfig:
     use_nll_gap: bool = True         # 用 NLL 差近似 KL 差
 
 
+# 新增：知识蒸馏配置（离线KD）
+@dataclass
+class KDConfig:
+    kd_type: str = "hard"                        # "hard"=伪标签KD；"soft"=分布蒸馏（需额外实现与更高显存）
+    teacher_model_name: Optional[str] = None     # 若为None，默认使用 config.model.model_name
+    student_model_name: Optional[str] = None     # 若为None，默认使用 config.model.model_name
+    teacher_ckpt: Optional[str] = None           # 若为None，默认使用 config.kga.ad_checkpoint
+    student_init_ckpt: Optional[str] = None      # 学生初始化权重（可选）
+    an_out_ckpt: str = "weights/an_student.pt"      # 训练完成的 An 输出路径
+    af_out_ckpt: str = "weights/af_student.pt"      # 训练完成的 Af 输出路径
+    gen_max_len: int = 1024                       # 教师生成伪标签的最长长度
+    gen_temperature: float = 0.7                 # 教师生成温度
+
+
 @dataclass
 class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     kga: KGAConfig = field(default_factory=KGAConfig)
+    kd: KDConfig = field(default_factory=KDConfig)
 
 
 # 全局配置对象
