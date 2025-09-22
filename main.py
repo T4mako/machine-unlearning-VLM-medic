@@ -163,11 +163,7 @@ def precompute_af_nll_singleton(model_name: str, ckpt_af: str, forget_data, out_
 def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_ckpt: str, max_len: int, temperature: float):
     """仅加载一次教师模型，为给定数据集生成伪标签并保存到磁盘。"""
     logging.info(f"[KD] 准备伪标签 -> {out_path}")
-
-    # 加载教师模型
-    logging.info(f"[KD] 加载教师模型: {teacher_model_name}")
     teacher = GenerativeQwenVLModel(model_name=teacher_model_name, use_fast=config.model.use_fast)
-
     try:
         teacher.enable_unlearning(False)
     except Exception:
@@ -183,8 +179,8 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
     all_prompts = []
     all_labels = []
     for images, texts, _ in _iter_batches(dataset, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
+        assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
         gens = teacher.generate(images, texts, max_length=max_len, temperature=temperature)
-        logging.info(f"[KD] 生成伪标签: {gens[:2]}")
         all_prompts.extend(texts)
         all_labels.extend(gens)
     # 保存
@@ -204,8 +200,6 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
         pass
 
 
-# ================= 离线KD：训练学生 =================
-
 def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, student_model_name: str = None, student_init_ckpt: str = None):
     """仅加载一次学生模型，使用磁盘伪标签进行监督训练并保存checkpoint。"""
     payload = torch.load(labels_path)
@@ -213,12 +207,11 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     kd_labels = payload.get("labels", [])
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
-    model_name_to_use = student_model_name or config.kd.student_model_name or config.model.model_name
-    logging.info(f"[KD] 训练学生模型: {model_name_to_use}")
+    # 强制只用多模态主模型
+    model_name_to_use = config.model.model_name
     student = GenerativeQwenVLModel(model_name=model_name_to_use, use_fast=config.model.use_fast)
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
-        logging.info(f"[KD] An/Af 不使用遗忘层")
     except Exception:
         pass
     if student_init_ckpt:
@@ -232,7 +225,6 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     # 优化器
     optim = torch.optim.AdamW(student.parameters(), lr=config.train.lr)
 
-    # 训练循环
     B = max(int(config.train.batch_size), 1)
     n_items = len(dataset)
     debug_limit = getattr(config.train, 'debug_limit', None)
@@ -251,9 +243,8 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
             batch = dataset[i: i + B]
             images = [x["image"] for x in batch]
             texts = [x["text"] for x in batch]
-            # 用对应范围内的KD伪标签
             targets = _get_kd_target_slice(i, min(i + B, n_items))
-
+            assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
             loss = student.loss_on_batch(images, texts, targets)
             optim.zero_grad(set_to_none=True)
             loss.backward()
