@@ -212,12 +212,14 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
 
     model_name_to_use = student_model_name
     student = GenerativeQwenVLModel(model_name=model_name_to_use, use_fast=config.model.use_fast)
+    logging.info(f"[KD] 学生模型已加载完毕: {model_name_to_use}")
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
     except Exception:
         pass
     if student_init_ckpt:
         try:
+            logging.info(f"[KD] 尝试加载学生初始化checkpoint: {student_init_ckpt}")
             state = torch.load(student_init_ckpt, map_location=student.device)
             student.load_state_dict(state)
             logging.info(f"[KD] 学生初始化checkpoint已加载: {student_init_ckpt}")
