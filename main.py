@@ -192,12 +192,14 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
     }, out_path)
     logging.info(f"[KD] 伪标签已保存: {out_path} | {len(all_labels)} 条")
 
-    # 释放教师
+    # 彻底释放教师模型与显存
     del teacher
+    logging.info("[KD] 教师模型已释放，开始清理GPU显存...")
     try:
         torch.cuda.empty_cache()
+        logging.info("[KD] GPU显存已清理完毕")
     except Exception:
-        pass
+        logging.warning("[KD] GPU显存清理失败")
 
 
 def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, student_model_name: str = None, student_init_ckpt: str = None):
