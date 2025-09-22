@@ -285,12 +285,53 @@ def main():
 
     parser.add_argument('--mode', choices=['distill_an', 'distill_af','precompute_gap', 'precompute_af_nll', 'train_with_af', ], default='precompute_gap',
                         help='分批运行模式：precompute_gap=仅加载AD与An计算目标差距G；precompute_af_nll=仅加载Af预计算Df上的NLL缓存；train_with_af=仅加载A*并从缓存读取Af的NLL进行KGA训练；distill_an=离线KD训练An；distill_af=离线KD训练Af。')
+    parser.add_argument('--mode', choices=[
+        'distill_an_labels', 'distill_an_train',
+        'distill_af_labels', 'distill_af_train',
+        'distill_an', 'distill_af',
+        'precompute_gap', 'precompute_af_nll', 'train_with_af',
+    ], default='precompute_gap',
+        help='分批运行模式：distill_an_labels=仅生成An的KD伪标签；distill_an_train=仅用An伪标签训练学生；distill_af_labels=仅生成Af的KD伪标签；distill_af_train=仅用Af伪标签训练学生；precompute_gap=仅加载AD与An计算G；precompute_af_nll=仅加载Af预计算Df上的NLL缓存；train_with_af=仅加载A*并从缓存读取Af的NLL进行KGA训练；distill_an/ distill_af 为一键流程（先标签后训练）。')
     parser.add_argument('--baseline_gap', type=float, default=None, help='可选：覆盖 baseline_gap（当分批运行无法同时加载AD/An时可用）。')
     args, _ = parser.parse_known_args()
 
     # 1. 数据
     retain_data, forget_data, dn_data, val_data = prepare_datasets()
     logging.info(f"数据已划分 - Retain: {len(retain_data)}, Forget: {len(forget_data)}, Dn: {len(dn_data)}, Val: {len(val_data)}")
+
+    # 拆分后的KD模式：只生成伪标签
+    if args.mode in ("distill_an_labels", "distill_af_labels"):
+        role = 'an' if args.mode == 'distill_an_labels' else 'af'
+        dataset = dn_data if role == 'an' else forget_data
+        labels_path = os.path.join('logs', f'{role}_kd_labels.pt')
+        teacher_model_name = (config.kd.teacher_model_name or config.model.model_name)
+        teacher_ckpt = (config.kd.teacher_ckpt or config.kga.ad_checkpoint)
+        prepare_kd_labels(
+            dataset=dataset,
+            out_path=labels_path,
+            teacher_model_name=teacher_model_name,
+            teacher_ckpt=teacher_ckpt,
+            max_len=int(config.kd.gen_max_len),
+            temperature=float(config.kd.gen_temperature)
+        )
+        logging.info(f"[KD] {role.upper()} 伪标签已生成 -> {labels_path}")
+        return
+
+    # 拆分后的KD模式：只训练学生
+    if args.mode in ("distill_an_train", "distill_af_train"):
+        role = 'an' if args.mode == 'distill_an_train' else 'af'
+        dataset = dn_data if role == 'an' else forget_data
+        labels_path = os.path.join('logs', f'{role}_kd_labels.pt')
+        out_ckpt = (config.kd.an_out_ckpt if role == 'an' else config.kd.af_out_ckpt)
+        train_student_from_kd_labels(
+            dataset=dataset,
+            labels_path=labels_path,
+            out_ckpt=out_ckpt,
+            student_model_name=(config.kd.student_model_name or 'ibm-granite/granite-docling-258M'),
+            student_init_ckpt=(config.kd.student_init_ckpt or None)
+        )
+        logging.info(f"[KD] {role.upper()} 学生训练完成 -> {out_ckpt}")
+        return
 
     # 新增KD模式
     if args.mode in ("distill_an", "distill_af"):
