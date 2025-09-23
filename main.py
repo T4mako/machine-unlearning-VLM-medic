@@ -208,10 +208,10 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     logging.info(f"[KD] {student_model_name} 模型加载 payload: {labels_path}")
     payload = torch.load(labels_path)
     logging.info(f"[KD] {student_model_name} 模型加载 prompt 和 label")
-    logging.info(f"[KD] 示例 prompt: {kd_prompts[0] if kd_prompts else '无'}")
-    logging.info(f"[KD] 示例 label: {kd_labels[0] if kd_labels else '无'}")
     kd_prompts = payload.get("prompts", [])
     kd_labels = payload.get("labels", [])
+    logging.info(f"[KD] 示例 prompt: {kd_prompts[0] if kd_prompts else '无'}")
+    logging.info(f"[KD] 示例 label: {kd_labels[0] if kd_labels else '无'}")
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
     model_name_to_use = student_model_name
