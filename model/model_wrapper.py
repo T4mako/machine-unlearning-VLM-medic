@@ -21,6 +21,18 @@ try:
 except Exception:
     to_pil_image = None
 
+# 新增：QLoRA/PEFT 支持
+try:
+    from peft import LoraConfig, get_peft_model
+except Exception:
+    LoraConfig = None  # type: ignore
+    get_peft_model = None  # type: ignore
+
+try:
+    import bitsandbytes as bnb  # noqa: F401
+except Exception:
+    bnb = None  # type: ignore
+
 
 class GenerativeQwenVLModel(nn.Module):
     """
@@ -41,18 +53,35 @@ class GenerativeQwenVLModel(nn.Module):
         self.max_seq_len = config.model.max_seq_len  # 针对对话式长文本设置上下文上限
 
         self.text_only: bool = False
-        dtype = torch.bfloat16
+        # 按配置选择精度
+        dtype = torch.bfloat16 if str(getattr(config.model, "precision", "bf16")).lower() == "bf16" else torch.float16
 
         # 优先加载多模态生成模型
         self.model = None
         self.processor = None
+        # 4-bit 量化与设备映射配置
+        load_in_4bit = bool(getattr(config.model, "load_in_4bit", False))
+        device_map = getattr(config.model, "device_map", "auto")
+        offload_folder = getattr(config.model, "offload_folder", "offload")
+
+        common_kwargs = {
+            "trust_remote_code": True,
+            "torch_dtype": dtype,
+            "device_map": device_map,
+            "offload_folder": offload_folder,
+        }
+        if load_in_4bit and (bnb is not None):
+            common_kwargs.update({
+                "load_in_4bit": True,
+                "bnb_4bit_use_double_quant": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": dtype,
+            })
+
         try:
             self.model = AutoModelForImageTextToText.from_pretrained(
                 model_name,
-                trust_remote_code=True,
-                dtype=torch.bfloat16,
-                device_map="auto",
-                offload_folder="offload"
+                **common_kwargs,
             )
             self.processor = AutoProcessor.from_pretrained(
                 model_name,
@@ -65,10 +94,7 @@ class GenerativeQwenVLModel(nn.Module):
             try:
                 self.model = AutoModelForVision2Seq.from_pretrained(
                     model_name,
-                    trust_remote_code=True,
-                    torch_dtype=dtype,
-                    device_map="auto",
-                    offload_folder="offload",
+                    **common_kwargs,
                 )
                 self.processor = AutoProcessor.from_pretrained(
                     model_name,
@@ -82,12 +108,11 @@ class GenerativeQwenVLModel(nn.Module):
                     raise
                 logging.info(f"多模态加载失败，回退为文本-only模型: {e} | Vision2Seq失败: {e2}")
                 self.text_only = True
+                # 文本-only 也支持 4-bit
+                text_kwargs = dict(common_kwargs)
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    trust_remote_code=True,
-                    torch_dtype=dtype,
-                    device_map="auto",
-                    offload_folder="offload",
+                    **text_kwargs,
                 )
                 # 文本-only 使用 tokenizer 作为processor占位
                 self.processor = AutoTokenizer.from_pretrained(
@@ -105,6 +130,36 @@ class GenerativeQwenVLModel(nn.Module):
         self.unlearning_layer: Optional[UnlearningLayer] = None
         if self.unl_enabled and self.hidden_size > 0:
             self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+
+        # ===== 训练显存优化：LoRA & 梯度检查点 =====
+        try:
+            self.model.config.use_cache = False  # 训练禁用 KV cache
+        except Exception:
+            pass
+        if bool(getattr(config.model, "gradient_checkpointing", False)):
+            try:
+                self.model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
+        # LoRA 仅在启用时注入，并且只训练 LoRA 权重（其余冻结）
+        if bool(getattr(config.model, "lora_enabled", False)) and (LoraConfig is not None) and (get_peft_model is not None):
+            lora_cfg = LoraConfig(
+                r=int(getattr(config.model, "lora_r", 16)),
+                lora_alpha=int(getattr(config.model, "lora_alpha", 32)),
+                lora_dropout=float(getattr(config.model, "lora_dropout", 0.05)),
+                target_modules=list(getattr(config.model, "lora_target_modules", [])),
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.model = get_peft_model(self.model, lora_cfg)
+            for p in self.model.parameters():
+                p.requires_grad = False
+            # 仅 LoRA 权重训练
+            for name, p in self.model.named_parameters():
+                if "lora" in name:
+                    p.requires_grad = True
+            logging.info("已注入 LoRA 适配器并冻结主干参数")
 
     def enable_unlearning(self, enabled: bool = True):
         self.unl_enabled = bool(enabled)
@@ -130,77 +185,35 @@ class GenerativeQwenVLModel(nn.Module):
             return [to_pil_image(x)]
         return [x]
 
-    # 新增：文本-only 输入准备
-    def _prepare_inputs_text_only(self, texts, targets: Optional[List[str]] = None):
-        if isinstance(texts, str):
-            texts = [texts]
-        B = len(texts)
-        tokenizer = self.processor  # type: ignore
-        if targets is None:
-            enc = tokenizer(
-                texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.max_seq_len,
-            )
-            for k, v in enc.items():
-                if isinstance(v, torch.Tensor):
-                    enc[k] = v.to(self.device)
-            return enc
-        else:
-            if isinstance(targets, str):
-                targets = [targets]
-            if len(targets) == 1 and B > 1:
-                targets = [targets[0] for _ in range(B)]
-            if len(targets) != B:
-                raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
-            # 逐样本构建 input_ids 与 labels，遮住 prompt 部分
-            input_ids_list = []
-            labels_list = []
-            attn_list = []
-            for t, y in zip(texts, targets):
-                ids_prompt = tokenizer.encode(t, add_special_tokens=False)
-                # 在大多数CausalLM中，追加一个分隔符/空格更稳妥
-                ids_target = tokenizer.encode(y, add_special_tokens=False)
-                # 拼接，并在末尾追加 eos
-                eos_id = tokenizer.eos_token_id
-                if eos_id is not None:
-                    full = ids_prompt + ids_target + [eos_id]
-                else:
-                    full = ids_prompt + ids_target
-                input_ids_list.append(torch.tensor(full, dtype=torch.long))
-                # labels：遮住 prompt 部分
-                labels = torch.tensor(full, dtype=torch.long)
-                labels[:len(ids_prompt)] = -100
-                labels_list.append(labels)
-                attn_list.append(torch.ones_like(labels, dtype=torch.long))
-            # pad 到同长
-            max_len = max(x.size(0) for x in input_ids_list)
-            def pad_to(x, val):
-                if x.size(0) == max_len:
-                    return x
-                pad = torch.full((max_len - x.size(0),), val, dtype=x.dtype)
-                return torch.cat([x, pad], dim=0)
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
-            input_ids = torch.stack([pad_to(x, pad_id) for x in input_ids_list], dim=0)
-            labels = torch.stack([pad_to(x, -100) for x in labels_list], dim=0)
-            attention_mask = torch.stack([pad_to(x, 0) for x in attn_list], dim=0)
-            return {
-                "input_ids": input_ids.to(self.device),
-                "attention_mask": attention_mask.to(self.device),
-                "labels": labels.to(self.device),
-            }
-
-    # 新增：将任意输入规格统一为“每条样本一个PIL列表”的批格式 List[List[PIL]]
+    # 新增：将任意输入规格统一为“每条样本一个PIL列表”的批格式 List[List[PIL]]，并在训练时限制分辨率
     def _ensure_pil_per_sample(self, images) -> List[List]:
         """支持以下输入：
         - 单张图：PIL/tensor -> [[PIL]]
         - 单样本多图：List[PIL/tensor] -> [List[PIL]]
         - Batch：List[ Pils 或 List[PIL] ] -> List[List[PIL]]
+        附加：若配置了 max_image_res，则按最长边缩放至不超过该分辨率。
         """
         def to_pil(x):
             return self._ensure_pil_list(x)[0] if not isinstance(x, list) else [self._ensure_pil_list(i)[0] for i in x]
+
+        def maybe_resize(pil):
+            max_res = int(getattr(config.model, "max_image_res", 0))
+            if max_res <= 0:
+                return pil
+            try:
+                w, h = pil.size
+                scale = min(1.0, float(max_res) / float(max(w, h)))
+                if scale < 1.0:
+                    new_w = max(1, int(w * scale))
+                    new_h = max(1, int(h * scale))
+                    return pil.resize((new_w, new_h))
+            except Exception:
+                pass
+            return pil
+
+        def ensure_pil_list_and_resize(x):
+            lst = self._ensure_pil_list(x)
+            return [maybe_resize(i) for i in lst]
 
         if isinstance(images, list):
             # 判定是否为 batch（元素本身是列表或混合）
@@ -208,16 +221,16 @@ class GenerativeQwenVLModel(nn.Module):
                 batch = []
                 for el in images:
                     if isinstance(el, list):
-                        batch.append(self._ensure_pil_list(el))
+                        batch.append(ensure_pil_list_and_resize(el))
                     else:
-                        batch.append(self._ensure_pil_list(el))  # 单图样本
+                        batch.append(ensure_pil_list_and_resize(el))  # 单图样本
                 return batch
             else:
                 # 单样本多图
-                return [self._ensure_pil_list(images)]
+                return [ensure_pil_list_and_resize(images)]
         else:
             # 单样本单图
-            return [[self._ensure_pil_list(images)[0]]]
+            return [[ensure_pil_list_and_resize(images)[0]]]
 
     def _prepare_inputs(self, images, texts, targets: Optional[List[str]] = None):
         """准备模型输入；当提供targets时，构造labels与input_ids等长，并对prompt部分置-100。

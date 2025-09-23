@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
@@ -14,6 +14,22 @@ class ModelConfig:
     # === 新增：遗忘层相关 ===
     enable_unl: bool = True           # 是否启用遗忘层（UnlearningLayer）
     unl_hidden_dim: int = 256          # 遗忘层瓶颈维度（MLP隐藏维）
+    # === 新增：低显存训练开关 ===
+    precision: str = "bf16"            # "bf16" 或 "fp16"
+    load_in_4bit: bool = True          # 是否以 4-bit 量化加载（QLoRA）
+    gradient_checkpointing: bool = True  # 是否开启梯度检查点
+    device_map: str = "auto"           # 模型设备映射
+    offload_folder: str = "offload"    # 当需要 CPU/NVMe offload 时的目录
+    # LoRA 配置（仅当 lora_enabled=True 时生效）
+    lora_enabled: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"
+    ])
+    # 图像与文本上限（用于进一步降低显存）
+    max_image_res: int = 256           # 训练阶段统一缩放至不超过该分辨率的正方形
 
 
 @dataclass
@@ -26,6 +42,9 @@ class TrainConfig:
     # === 新增：训练目标 & 冻结策略 ===
     objective: str = "kga"            # 训练目标："kga" 或 "eul"
     freeze_backbone: bool = True      # 启用遗忘层时，是否冻结主干参数，仅训练遗忘层
+    # === 新增：低显存训练参数 ===
+    gradient_accumulation_steps: int = 16  # 梯度累积步数
+    use_8bit_optimizer: bool = False       # 是否使用 8-bit 优化器（bitsandbytes）
 
 
 @dataclass
