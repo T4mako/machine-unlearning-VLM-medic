@@ -97,7 +97,7 @@ class GenerativeFlorenceModel(nn.Module):
             prompt_ids = prompt_enc["input_ids"]  # [B, Lp]
             pixel_values = prompt_enc["pixel_values"].to(self.device, dtype=self.torch_dtype)
     
-            target_enc = self.processor(text=targets, return_tensors="pt")
+            target_enc = self.processor(text=targets, images=images, return_tensors="pt")
             target_ids = target_enc["input_ids"]  # [B, Lt]
     
             B = prompt_ids.size(0)
