@@ -84,7 +84,7 @@ class GenerativeFlorenceModel(nn.Module):
             return texts_out
     
         def loss_on_batch(self, images, texts, targets):
-            # 批量：对每个样本将 prompt 与 target 拼接，使用 -100 屏蔽 prompt 的损失
+            # Florence推荐：直接拼接prompt+target，统一padding/max_length，屏蔽prompt部分loss
             if isinstance(images, Image.Image):
                 images = [images]
             if isinstance(texts, str):
@@ -93,43 +93,32 @@ class GenerativeFlorenceModel(nn.Module):
                 targets = [targets]
             assert len(images) == len(texts) == len(targets), "Florence.loss_on_batch: 批大小不一致"
     
-            prompt_enc = self.processor(text=texts, images=images, return_tensors="pt")
-            prompt_ids = prompt_enc["input_ids"]  # [B, Lp]
-            pixel_values = prompt_enc["pixel_values"].to(self.device, dtype=self.torch_dtype)
+            # 拼接prompt+target
+            full_texts = [p + t for p, t in zip(texts, targets)]
+            # Florence推荐padding方式
+            max_length = 1024  # Florence-2-base推荐最大长度
+            inputs = self.processor(
+                text=full_texts,
+                images=images,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=max_length,
+            )
+            input_ids = inputs["input_ids"].to(self.device)
+            pixel_values = inputs["pixel_values"].to(self.device, dtype=self.torch_dtype)
+            attention_mask = inputs["attention_mask"].to(self.device)
     
-            target_enc = self.processor(text=targets, images=images, return_tensors="pt")
-            target_ids = target_enc["input_ids"]  # [B, Lt]
-    
-            B = prompt_ids.size(0)
-            combined_ids_list = []
-            combined_labels_list = []
-            pad_token_id = self.processor.tokenizer.pad_token_id
-            if pad_token_id is None:
-                pad_token_id = self.processor.tokenizer.eos_token_id
-            for i in range(B):
-                p_ids = prompt_ids[i]
-                t_ids = target_ids[i]
-                combined = torch.cat([p_ids, t_ids], dim=0)
-                labels = combined.clone()
-                labels[: p_ids.size(0)] = -100  # 屏蔽prompt部分的loss
-                combined_ids_list.append(combined)
-                combined_labels_list.append(labels)
-    
-            max_len = max(x.size(0) for x in combined_ids_list)
-            input_ids_padded = torch.full((B, max_len), pad_token_id, dtype=torch.long)
-            labels_padded = torch.full((B, max_len), -100, dtype=torch.long)
-            attention_mask = torch.zeros((B, max_len), dtype=torch.long)
-            for i in range(B):
-                seq_len = combined_ids_list[i].size(0)
-                input_ids_padded[i, :seq_len] = combined_ids_list[i]
-                labels_padded[i, :seq_len] = combined_labels_list[i]
-                attention_mask[i, :seq_len] = 1
+            # 屏蔽prompt部分loss
+            labels = input_ids.clone()
+            for i, prompt in enumerate(texts):
+                prompt_ids = self.processor(text=prompt, images=[images[i]], return_tensors="pt", padding="max_length", max_length=max_length)["input_ids"][0]
+                labels[i, :len(prompt_ids)] = -100
     
             outputs = self.model(
-                input_ids=input_ids_padded.to(self.device),
-                attention_mask=attention_mask.to(self.device),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 pixel_values=pixel_values,
-                labels=labels_padded.to(self.device),
+                labels=labels,
             )
             loss = outputs.loss
             return loss
