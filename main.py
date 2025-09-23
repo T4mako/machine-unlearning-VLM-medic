@@ -204,7 +204,7 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
 
 def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, student_model_name: str = None, student_init_ckpt: str = None):
     """仅加载一次学生模型，使用磁盘伪标签进行监督训练并保存checkpoint。"""
-    logging.info(f"[KD] 加载学生模型: {student_model_name}")
+    logging.info(f"[KD] 加载学生 模型: {student_model_name}")
     logging.info(f"[KD] {student_model_name} 模型加载 payload: {labels_path}")
     payload = torch.load(labels_path)
     logging.info(f"[KD] {student_model_name} 模型加载 prompt 和 label")

@@ -84,7 +84,11 @@ class GenerativeFlorenceModel(nn.Module):
             return texts_out
     
         def loss_on_batch(self, images, texts, targets):
-            # Florence推荐：直接拼接prompt+target，统一padding/max_length，屏蔽prompt部分loss
+            print("Targets example:", targets[:5])
+            print("Texts example:", texts[:2])
+            print("Batch size:", len(images), len(texts), len(targets))
+            targets_tensor = torch.tensor(targets)
+            print("KD labels min:", targets_tensor.min().item(), "max:", targets_tensor.max().item())
             if isinstance(images, Image.Image):
                 images = [images]
             if isinstance(texts, str):
