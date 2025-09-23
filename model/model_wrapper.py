@@ -62,25 +62,41 @@ class GenerativeQwenVLModel(nn.Module):
             )
             logging.info("模型已加载（多模态 ImageTextToText）")
         except Exception as e:
-            # 回退：文本-only 模型
-            if AutoModelForCausalLM is None or AutoTokenizer is None:
-                raise
-            logging.info(f"多模态加载失败，回退为文本-only模型: {e}")
-            self.text_only = True
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                torch_dtype=dtype,
-                device_map="auto",
-                offload_folder="offload",
-            )
-            # 文本-only 使用 tokenizer 作为processor占位
-            self.processor = AutoTokenizer.from_pretrained(
-                model_name,
-                use_fast=use_fast,
-                trust_remote_code=True,
-            )
-            logging.info("模型已加载（文本-only CausalLM）")
+            # 兼容：若 ImageTextToText 失败，尝试 Vision2Seq
+            try:
+                self.model = AutoModelForVision2Seq.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                    offload_folder="offload",
+                )
+                self.processor = AutoProcessor.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    use_fast=use_fast,
+                )
+                logging.info("模型已加载（多模态 Vision2Seq）")
+            except Exception as e2:
+                # 回退：文本-only 模型
+                if AutoModelForCausalLM is None or AutoTokenizer is None:
+                    raise
+                logging.info(f"多模态加载失败，回退为文本-only模型: {e} | Vision2Seq失败: {e2}")
+                self.text_only = True
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                    offload_folder="offload",
+                )
+                # 文本-only 使用 tokenizer 作为processor占位
+                self.processor = AutoTokenizer.from_pretrained(
+                    model_name,
+                    use_fast=use_fast,
+                    trust_remote_code=True,
+                )
+                logging.info("模型已加载（文本-only CausalLM）")
 
         # ===== 遗忘层 =====
         logging.info("初始化遗忘层...")
@@ -258,7 +274,7 @@ class GenerativeQwenVLModel(nn.Module):
             # 1) 获取每条样本prompt的token长度（包含多图占位）
             logging.info(f"convs_user_only {convs_user_only}")
             prompt_token_ids_list = self.processor.apply_chat_template(
-                convs_user_only, tokenize=True, add_generation_prompt=True
+                convs_user_only, images=images_per_sample, tokenize=True, add_generation_prompt=True
             )
             if isinstance(prompt_token_ids_list[0], int):
                 prompt_token_ids_list = [prompt_token_ids_list]

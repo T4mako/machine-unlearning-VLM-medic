@@ -326,12 +326,13 @@ def main():
         dataset = dn_data if role == 'an' else forget_data
         labels_path = os.path.join('logs', f'{role}_kd_labels.pt')
         out_ckpt = (config.kd.an_out_ckpt if role == 'an' else config.kd.af_out_ckpt)
-        logging.info(f"[KD] {role.upper()} 加载学生模型: {'ibm-granite/granite-docling-258M'}")
+        student_name = config.kd.student_model_name or config.model.model_name
+        logging.info(f"[KD] {role.upper()} 加载学生模型: {student_name}")
         train_student_from_kd_labels(
             dataset=dataset,
             labels_path=labels_path,
             out_ckpt=out_ckpt,
-            student_model_name=('ibm-granite/granite-docling-258M'),
+            student_model_name=student_name,
             student_init_ckpt=(config.kd.student_init_ckpt or None)
         )
         logging.info(f"[KD] {role.upper()} 学生训练完成 -> {out_ckpt}")
@@ -358,7 +359,7 @@ def main():
             dataset=dataset,
             labels_path=labels_path,
             out_ckpt=out_ckpt,
-            student_model_name=('ibm-granite/granite-docling-258M'),
+            student_model_name=student_name,
             student_init_ckpt=(config.kd.student_init_ckpt or None)
         )
         logging.info(f"[KD] {role.upper()} 蒸馏流程完成 -> {out_ckpt}")
@@ -376,7 +377,7 @@ def main():
         an_model_name = config.model.model_name
         try:
             if ckpt_an and os.path.abspath(ckpt_an) == os.path.abspath(config.kd.an_out_ckpt):
-                an_model_name = ('ibm-granite/granite-docling-258M')
+                an_model_name = config.kd.student_model_name or ('ibm-granite/granite-docling-258M')
         except Exception:
             pass
         gap = compute_baseline_gap_dual(
@@ -402,7 +403,7 @@ def main():
         af_model_name = config.model.model_name
         try:
             if ckpt_af and os.path.abspath(ckpt_af) == os.path.abspath(config.kd.af_out_ckpt):
-                af_model_name = ('ibm-granite/granite-docling-258M')
+                af_model_name = config.kd.student_model_name or ('ibm-granite/granite-docling-258M')
         except Exception:
             pass
         out_path = os.path.join('logs', 'af_nll_forget.pt')
