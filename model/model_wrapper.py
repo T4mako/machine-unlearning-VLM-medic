@@ -31,7 +31,6 @@ class GenerativeQwenVLModel(nn.Module):
     2. compute_nll: 计算给定target的负对数似然（用于KGA知识差距计算）
     3. forward: 返回包含logits的对象以兼容旧接口
     另外：
-    - 支持文本-only 小模型回退（如 ibm-granite/granite-docling-258M），自动忽略图像分支。
     - 提供 loss_on_batch 用于蒸馏训练（带梯度）。
     """
 
@@ -42,7 +41,7 @@ class GenerativeQwenVLModel(nn.Module):
         self.max_seq_len = config.model.max_seq_len  # 针对对话式长文本设置上下文上限
 
         self.text_only: bool = False
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        dtype = torch.bfloat16
 
         # 优先加载多模态生成模型
         self.model = None
