@@ -84,6 +84,14 @@ class GenerativeFlorenceModel(nn.Module):
             return texts_out
     
         def loss_on_batch(self, images, texts, targets):
+            # 转换为 RGB 格式
+            if isinstance(images, Image.Image):
+                image = images.convert("RGB")
+            else:
+                image = to_pil_image(images)
+            # 归一化到 [-1, 1]
+            pixel_values = np.array(image).astype(np.float32) / 255.0
+            pixel_values = (pixel_values - 0.5) * 2.0  # [-1, 1]
             # 保证类型统一
             if isinstance(images, Image.Image):
                 images = [images]
