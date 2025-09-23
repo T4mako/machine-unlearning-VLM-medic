@@ -110,6 +110,7 @@ class GenerativeFlorenceModel(nn.Module):
             input_ids = inputs["input_ids"].to(self.device)
             pixel_values = inputs["pixel_values"].to(self.device, dtype=self.torch_dtype)
             attention_mask = inputs["attention_mask"].to(self.device)
+            print("pixel_values range:", pixel_values.min().item(), pixel_values.max().item())
 
             # 构造 labels，屏蔽 prompt 部分 loss
             labels = input_ids.clone()
