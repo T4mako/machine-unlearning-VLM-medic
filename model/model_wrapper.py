@@ -118,7 +118,7 @@ class GenerativeFlorenceModel(nn.Module):
                     text=prompt,
                     images=[images[i]],
                     return_tensors="pt",
-                    padding="max_length",
+                    padding=False, 
                     truncation=True,
                     max_length=max_length
                 )["input_ids"][0]
