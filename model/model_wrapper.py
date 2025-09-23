@@ -185,6 +185,66 @@ class GenerativeQwenVLModel(nn.Module):
             return [to_pil_image(x)]
         return [x]
 
+    # 文本-only 输入准备（供 _prepare_inputs 调用）
+    def _prepare_inputs_text_only(self, texts, targets: Optional[List[str]] = None):
+        tokenizer = self.processor  # type: ignore
+        if isinstance(texts, str):
+            texts = [texts]
+        B = len(texts)
+        if targets is None:
+            enc = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_len,
+            )
+            for k, v in enc.items():
+                if isinstance(v, torch.Tensor):
+                    enc[k] = v.to(self.device)
+            return enc
+        else:
+            if isinstance(targets, str):
+                targets = [targets]
+            if len(targets) == 1 and B > 1:
+                targets = [targets[0] for _ in range(B)]
+            if len(targets) != B:
+                raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
+            # 逐样本构建 input_ids 与 labels，遮住 prompt 部分
+            input_ids_list = []
+            labels_list = []
+            attn_list = []
+            for t, y in zip(texts, targets):
+                ids_prompt = tokenizer.encode(t, add_special_tokens=False)
+                ids_target = tokenizer.encode(y, add_special_tokens=False)
+                eos_id = tokenizer.eos_token_id
+                if eos_id is not None:
+                    full = ids_prompt + ids_target + [eos_id]
+                else:
+                    full = ids_prompt + ids_target
+                input_ids_tensor = torch.tensor(full, dtype=torch.long)
+                labels_tensor = input_ids_tensor.clone()
+                labels_tensor[:len(ids_prompt)] = -100
+                attn_tensor = torch.ones_like(labels_tensor, dtype=torch.long)
+                input_ids_list.append(input_ids_tensor)
+                labels_list.append(labels_tensor)
+                attn_list.append(attn_tensor)
+            max_len = max(x.size(0) for x in input_ids_list)
+            def pad_to(x, val):
+                if x.size(0) == max_len:
+                    return x
+                pad = torch.full((max_len - x.size(0),), val, dtype=x.dtype)
+                return torch.cat([x, pad], dim=0)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
+            input_ids = torch.stack([pad_to(x, pad_id) for x in input_ids_list], dim=0)
+            labels = torch.stack([pad_to(x, -100) for x in labels_list], dim=0)
+            attention_mask = torch.stack([pad_to(x, 0) for x in attn_list], dim=0)
+            return {
+                "input_ids": input_ids.to(self.device),
+                "attention_mask": attention_mask.to(self.device),
+                "labels": labels.to(self.device),
+            }
+
     # 新增：将任意输入规格统一为“每条样本一个PIL列表”的批格式 List[List[PIL]]，并在训练时限制分辨率
     def _ensure_pil_per_sample(self, images) -> List[List]:
         """支持以下输入：
@@ -437,6 +497,11 @@ class GenerativeQwenVLModel(nn.Module):
                     outputs = self.model(**inputs)
                     loss = outputs.loss  # 已经是NLL
         return loss
+
+    # 新增：兼容旧接口的 forward（返回含 .loss 的对象）
+    def forward(self, images, texts, targets=None):
+        loss = self.loss_on_batch(images, texts, targets)
+        return SimpleNamespace(loss=loss)
 
     # 新增：训练用，返回带梯度的loss
     def loss_on_batch(self, images, texts, targets):

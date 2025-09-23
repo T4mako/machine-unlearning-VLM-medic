@@ -6,6 +6,18 @@ from typing import List, Dict, Optional
 from config import config
 from model.model_wrapper import GenerativeQwenVLModel
 
+# 可选：bitsandbytes 8-bit 优化器
+try:
+    import bitsandbytes as bnb  # type: ignore
+except Exception:
+    bnb = None  # type: ignore
+
+try:
+    from torch.cuda.amp import autocast, GradScaler
+except Exception:
+    autocast = None  # type: ignore
+    GradScaler = None  # type: ignore
+
 
 class KGATrainer:
     def __init__(self, A_star: GenerativeQwenVLModel,
@@ -24,7 +36,27 @@ class KGATrainer:
             opt_params = list(self.A_star.get_unlearning_parameters())
         else:
             opt_params = list(self.A_star.parameters())
-        self.optimizer = torch.optim.AdamW(opt_params, lr=lr)
+
+        # 训练精度与AMP
+        self.precision = str(getattr(config.model, "precision", "bf16")).lower()
+        self._amp_enabled = (torch.cuda.is_available() and (autocast is not None) and (self.precision in ["bf16", "fp16"]))
+        self._amp_dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
+        self.scaler = GradScaler(enabled=(self._amp_enabled and self.precision == "fp16")) if GradScaler is not None else None
+
+        # 梯度累积
+        self.grad_accum_steps = max(1, int(getattr(config.train, "gradient_accumulation_steps", 1)))
+
+        # 选择优化器：可选8-bit优化器
+        use_8bit_opt = bool(getattr(config.train, "use_8bit_optimizer", False))
+        if use_8bit_opt and (bnb is not None):
+            try:
+                self.optimizer = bnb.optim.AdamW8bit(opt_params, lr=lr)
+                print("[Trainer] Using bitsandbytes AdamW8bit optimizer.")
+            except Exception as e:
+                print(f"[Trainer][WARN] Failed to init AdamW8bit: {e}. Falling back to torch.optim.AdamW.")
+                self.optimizer = torch.optim.AdamW(opt_params, lr=lr)
+        else:
+            self.optimizer = torch.optim.AdamW(opt_params, lr=lr)
 
         self.retain_data = retain_data  # Dr
         self.forget_data = forget_data  # Df
@@ -155,79 +187,102 @@ class KGATrainer:
         print(f"[KGA] Early-stop threshold: {target_threshold:.6f}")
 
         global_step = 0
+        self.optimizer.zero_grad()
         for epoch in range(epochs):
             print(f"[KGA] Epoch {epoch+1}/{epochs}")
             total_loss = 0.0
             total_steps = 0
             t0 = time.time()
 
+            accum = 0
             for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
                 self.A_star.train()
-                self.optimizer.zero_grad()
 
-                if self.objective == "eul":
-                    # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
-                    out_f = self.A_star.forward(images, texts, targets)
-                    nll_astar_f = out_f.loss  # 需要梯度
-                    L_forget = - nll_astar_f
-
-                    # 保持项：在 Dr 上接近 AD
-                    if (len(self.retain_data) > 0) and (self.AD is not None):
-                        ridx = (global_step + step) % max(len(self.retain_data), 1)
-                        r_end = min(ridx + self.batch_size, len(self.retain_data))
-                        r_batch = self.retain_data[ridx:r_end]
-                        r_images = [x["image"] for x in r_batch]
-                        r_texts = [x["text"] for x in r_batch]
-                        r_targets = [x["target"] for x in r_batch]
-                        out_r = self.A_star.forward(r_images, r_texts, r_targets)
-                        nll_astar_r = out_r.loss  # 需要梯度
-                        with torch.no_grad():
-                            nll_ad_r = self.AD.compute_nll(r_images, r_texts, r_targets)
-                        L_retain = torch.abs(nll_astar_r - nll_ad_r)
-                    else:
-                        L_retain = torch.tensor(0.0, device=self.A_star.device)
-
-                    loss = L_forget + self.alpha * L_retain
-
+                # 前向与损失构造（AMP）
+                if self._amp_enabled and (autocast is not None):
+                    acm = autocast(device_type="cuda", dtype=self._amp_dtype)
                 else:
-                    # KGA：让 A* 与 Af 在 Df 的gap 接近 AD 与 An 在 Dn 的gap
-                    out_f = self.A_star.forward(images, texts, targets)
-                    nll_astar = out_f.loss  # 需要梯度
-                    if self.Af is not None:
-                        with torch.no_grad():
-                            nll_af = self.Af.compute_nll(images, texts, targets)
+                    # 上下文管理器的空实现
+                    from contextlib import nullcontext
+                    acm = nullcontext()
+                with acm:
+                    if self.objective == "eul":
+                        # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
+                        out_f = self.A_star.forward(images, texts, targets)
+                        nll_astar_f = out_f.loss  # 需要梯度
+                        L_forget = - nll_astar_f
+
+                        # 保持项：在 Dr 上接近 AD
+                        if (len(self.retain_data) > 0) and (self.AD is not None):
+                            ridx = (global_step + step) % max(len(self.retain_data), 1)
+                            r_end = min(ridx + self.batch_size, len(self.retain_data))
+                            r_batch = self.retain_data[ridx:r_end]
+                            r_images = [x["image"] for x in r_batch]
+                            r_texts = [x["text"] for x in r_batch]
+                            r_targets = [x["target"] for x in r_batch]
+                            out_r = self.A_star.forward(r_images, r_texts, r_targets)
+                            nll_astar_r = out_r.loss  # 需要梯度
+                            with torch.no_grad():
+                                nll_ad_r = self.AD.compute_nll(r_images, r_texts, r_targets)
+                            L_retain = torch.abs(nll_astar_r - nll_ad_r)
+                        else:
+                            L_retain = torch.tensor(0.0, device=self.A_star.device)
+
+                        loss = L_forget + self.alpha * L_retain
+
                     else:
-                        if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
-                            raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
-                        nll_af = torch.tensor(self.af_nll_batches[step], device=self.A_star.device, dtype=nll_astar.dtype)
-                    gap_star = torch.abs(nll_astar - nll_af)
+                        # KGA：让 A* 与 Af 在 Df 的gap 接近 AD 与 An 在 Dn 的gap
+                        out_f = self.A_star.forward(images, texts, targets)
+                        nll_astar = out_f.loss  # 需要梯度
+                        if self.Af is not None:
+                            with torch.no_grad():
+                                nll_af = self.Af.compute_nll(images, texts, targets)
+                        else:
+                            if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
+                                raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
+                            nll_af = torch.tensor(self.af_nll_batches[step], device=self.A_star.device, dtype=nll_astar.dtype)
+                        gap_star = torch.abs(nll_astar - nll_af)
 
-                    # 基线 gap_base = | NLL_AD(Dn) - NLL_An(Dn) | (用预估均值代替逐batch)
-                    gap_base = torch.tensor(self.baseline_gap, device=self.A_star.device, dtype=gap_star.dtype)
-                    La = torch.abs(gap_star - gap_base)
+                        # 基线 gap_base = | NLL_AD(Dn) - NLL_An(Dn) | (用预估均值代替逐batch)
+                        gap_base = torch.tensor(self.baseline_gap, device=self.A_star.device, dtype=gap_star.dtype)
+                        La = torch.abs(gap_star - gap_base)
 
-                    # 性能保持 Lr：在 Dr 上让 A* 接近 AD
-                    if (len(self.retain_data) > 0) and (self.AD is not None):
-                        ridx = (global_step + step) % max(len(self.retain_data), 1)
-                        r_end = min(ridx + self.batch_size, len(self.retain_data))
-                        r_batch = self.retain_data[ridx:r_end]
-                        r_images = [x["image"] for x in r_batch]
-                        r_texts = [x["text"] for x in r_batch]
-                        r_targets = [x["target"] for x in r_batch]
-                        out_r = self.A_star.forward(r_images, r_texts, r_targets)
-                        nll_astar_r = out_r.loss  # 需要梯度
-                        with torch.no_grad():
-                            nll_ad_r = self.AD.compute_nll(r_images, r_texts, r_targets)
-                        Lr = torch.abs(nll_astar_r - nll_ad_r)
+                        # 性能保持 Lr：在 Dr 上让 A* 接近 AD
+                        if (len(self.retain_data) > 0) and (self.AD is not None):
+                            ridx = (global_step + step) % max(len(self.retain_data), 1)
+                            r_end = min(ridx + self.batch_size, len(self.retain_data))
+                            r_batch = self.retain_data[ridx:r_end]
+                            r_images = [x["image"] for x in r_batch]
+                            r_texts = [x["text"] for x in r_batch]
+                            r_targets = [x["target"] for x in r_batch]
+                            out_r = self.A_star.forward(r_images, r_texts, r_targets)
+                            nll_astar_r = out_r.loss  # 需要梯度
+                            with torch.no_grad():
+                                nll_ad_r = self.AD.compute_nll(r_images, r_texts, r_targets)
+                            Lr = torch.abs(nll_astar_r - nll_ad_r)
+                        else:
+                            Lr = torch.tensor(0.0, device=self.A_star.device)
+
+                        loss = La + self.alpha * Lr
+
+                # 反向与优化（梯度累积 + AMP 梯度缩放）
+                loss_to_log = loss
+                loss = loss / self.grad_accum_steps
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                accum += 1
+                if accum % self.grad_accum_steps == 0:
+                    if self.scaler is not None and self.scaler.is_enabled():
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
                     else:
-                        Lr = torch.tensor(0.0, device=self.A_star.device)
+                        self.optimizer.step()
+                    self.optimizer.zero_grad()
 
-                    loss = La + self.alpha * Lr
-
-                loss.backward()
-                self.optimizer.step()
-
-                total_loss += float(loss.item())
+                total_loss += float(loss_to_log.item())
                 total_steps += 1
                 global_step += 1
 
@@ -235,9 +290,9 @@ class KGATrainer:
                     dt = time.time() - t0
                     ips = (total_steps * self.batch_size) / max(dt, 1e-6)
                     if self.objective == "eul":
-                        print(f"[EUL][train] step {step+1}/{steps_total} | L_forget={float(L_forget.item()):.4f} L_retain={float(L_retain.item()):.4f} loss={float(loss.item()):.4f} | {ips:.1f} samples/s")
+                        print(f"[EUL][train] step {step+1}/{steps_total} | L_forget={float(L_forget.item()):.4f} L_retain={float(L_retain.item()):.4f} loss={float(loss_to_log.item()):.4f} | {ips:.1f} samples/s")
                     else:
-                        print(f"[KGA][train] step {step+1}/{steps_total} | loss={float(loss.item()):.4f} | {ips:.1f} samples/s")
+                        print(f"[KGA][train] step {step+1}/{steps_total} | loss={float(loss_to_log.item()):.4f} | {ips:.1f} samples/s")
 
             epoch_loss = total_loss / max(total_steps, 1)
             print(f"[{self.objective.upper()}] Epoch {epoch+1} avg loss: {epoch_loss:.6f}")
