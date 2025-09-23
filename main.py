@@ -1,6 +1,6 @@
 from venv import logger
 from data.load_PubMedVision import prepare_datasets
-from model.model_wrapper import GenerativeQwenVLModel
+from model.model_wrapper import GenerativeQwenVLModel, GenerativeFlorenceModel
 from train.trainer import KGATrainer
 from eval import kga_eval
 from config import config
@@ -215,7 +215,7 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
     model_name_to_use = student_model_name
-    student = GenerativeQwenVLModel(model_name=student_model_name, use_fast=config.model.use_fast,precision=config.model.precision,load_in_4bit=config.model.load_in_4bit)
+    student = GenerativeFlorenceModel(model_name=student_model_name)
     logging.info(f"[KD] 学生模型已加载完毕: {model_name_to_use}")
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层

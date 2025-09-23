@@ -8,6 +8,7 @@ from transformers import AutoModelForVision2Seq, AutoProcessor, AutoModelForImag
 import torch.nn.functional as F
 from config import config
 from model.unlearning_layer import UnlearningLayer
+from PIL import Image
 
 # 新增：文本模型支持
 try:
@@ -33,7 +34,104 @@ try:
 except Exception:
     bnb = None  # type: ignore
 
-
+class GenerativeFlorenceModel(nn.Module):
+        def __init__(self, model_name: str = "microsoft/Florence-2-base"):
+            super().__init__()
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            self.model_name = model_name
+            # 加载Florence-2模型与处理器
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=self.torch_dtype,
+                trust_remote_code=True,
+            ).to(self.device)
+            self.processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
+    
+        def enable_unlearning(self, flag: bool):
+            # 与现有调用保持兼容；Florence学生不使用遗忘层
+            return
+    
+        @property
+        def dtype(self):
+            return self.torch_dtype
+    
+        @property
+        def device_type(self):
+            return str(self.device)
+    
+        def generate(self, images, texts, max_length: int = 512, temperature: float = 0.0):
+            # 支持单样本与批量
+            if isinstance(images, Image.Image):
+                images = [images]
+            if isinstance(texts, str):
+                texts = [texts]
+            assert len(images) == len(texts), "Florence.generate: images/texts 数量不一致"
+            enc = self.processor(text=texts, images=images, return_tensors="pt")
+            input_ids = enc["input_ids"].to(self.device)
+            pixel_values = enc["pixel_values"].to(self.device, dtype=self.torch_dtype)
+            do_sample = temperature is not None and float(temperature) > 0.0
+            gen_ids = self.model.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                max_new_tokens=int(max_length),
+                do_sample=do_sample,
+                temperature=float(temperature) if do_sample else None,
+                num_beams=1 if do_sample else 3,
+            )
+            texts_out = self.processor.batch_decode(gen_ids, skip_special_tokens=False)
+            return texts_out
+    
+        def loss_on_batch(self, images, texts, targets):
+            # 批量：对每个样本将 prompt 与 target 拼接，使用 -100 屏蔽 prompt 的损失
+            if isinstance(images, Image.Image):
+                images = [images]
+            if isinstance(texts, str):
+                texts = [texts]
+            if isinstance(targets, str):
+                targets = [targets]
+            assert len(images) == len(texts) == len(targets), "Florence.loss_on_batch: 批大小不一致"
+    
+            prompt_enc = self.processor(text=texts, images=images, return_tensors="pt")
+            prompt_ids = prompt_enc["input_ids"]  # [B, Lp]
+            pixel_values = prompt_enc["pixel_values"].to(self.device, dtype=self.torch_dtype)
+    
+            target_enc = self.processor(text=targets, return_tensors="pt")
+            target_ids = target_enc["input_ids"]  # [B, Lt]
+    
+            B = prompt_ids.size(0)
+            combined_ids_list = []
+            combined_labels_list = []
+            pad_token_id = self.processor.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self.processor.tokenizer.eos_token_id
+            for i in range(B):
+                p_ids = prompt_ids[i]
+                t_ids = target_ids[i]
+                combined = torch.cat([p_ids, t_ids], dim=0)
+                labels = combined.clone()
+                labels[: p_ids.size(0)] = -100  # 屏蔽prompt部分的loss
+                combined_ids_list.append(combined)
+                combined_labels_list.append(labels)
+    
+            max_len = max(x.size(0) for x in combined_ids_list)
+            input_ids_padded = torch.full((B, max_len), pad_token_id, dtype=torch.long)
+            labels_padded = torch.full((B, max_len), -100, dtype=torch.long)
+            attention_mask = torch.zeros((B, max_len), dtype=torch.long)
+            for i in range(B):
+                seq_len = combined_ids_list[i].size(0)
+                input_ids_padded[i, :seq_len] = combined_ids_list[i]
+                labels_padded[i, :seq_len] = combined_labels_list[i]
+                attention_mask[i, :seq_len] = 1
+    
+            outputs = self.model(
+                input_ids=input_ids_padded.to(self.device),
+                attention_mask=attention_mask.to(self.device),
+                pixel_values=pixel_values,
+                labels=labels_padded.to(self.device),
+            )
+            loss = outputs.loss
+            return loss
 class GenerativeQwenVLModel(nn.Module):
     """
     1. generate: 生成
@@ -343,7 +441,6 @@ class GenerativeQwenVLModel(nn.Module):
         for t, imgs in zip(texts, images_per_sample):
             content = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
             convs_user_only.append([{ "role": "user", "content": content }])
-        logging.info(f"[convs_user_only] {convs_user_only}")
         if targets is None:
             # 推理：只构造用户轮，添加generation prompt
             prompt_texts = self.processor.apply_chat_template(
@@ -365,9 +462,7 @@ class GenerativeQwenVLModel(nn.Module):
                 targets = [targets[0] for _ in range(B)]
             if len(targets) != B:
                 raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
-            logging.info(f"[KD] B样本数 {B} | 目标数 {len(targets)}")
             # 1) 获取每条样本prompt的token长度（包含多图占位）
-            logging.info(f"convs_user_only {convs_user_only}")
             prompt_token_ids_list = self.processor.apply_chat_template(
                 convs_user_only, tokenize=True, add_generation_prompt=True
             )
