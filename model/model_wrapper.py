@@ -99,7 +99,7 @@ class GenerativeQwenVLModel(nn.Module):
                 logging.info("模型已加载（文本-only CausalLM）")
 
         # ===== 遗忘层 =====
-        logging.info("初始化遗忘层...")
+        logging.info("初始化遗忘层...，但并未训练")
         self.hidden_size = int(getattr(self.model.config, "hidden_size", getattr(getattr(self.model, "config", object()), "hidden_size", 0)))
         self.unl_enabled: bool = bool(getattr(config.model, "enable_unl", False))
         self.unl_hidden_dim: int = int(getattr(config.model, "unl_hidden_dim", 128))
@@ -274,7 +274,7 @@ class GenerativeQwenVLModel(nn.Module):
             # 1) 获取每条样本prompt的token长度（包含多图占位）
             logging.info(f"convs_user_only {convs_user_only}")
             prompt_token_ids_list = self.processor.apply_chat_template(
-                convs_user_only, images=images_per_sample, tokenize=True, add_generation_prompt=True
+                convs_user_only, tokenize=True, add_generation_prompt=True
             )
             if isinstance(prompt_token_ids_list[0], int):
                 prompt_token_ids_list = [prompt_token_ids_list]

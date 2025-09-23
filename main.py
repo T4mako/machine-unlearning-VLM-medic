@@ -204,7 +204,7 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
 
 def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, student_model_name: str = None, student_init_ckpt: str = None):
     """仅加载一次学生模型，使用磁盘伪标签进行监督训练并保存checkpoint。"""
-    logging.info(f"[KD] 加载学生模型: {student_model_name or 'ibm-granite/granite-docling-258M'}")
+    logging.info(f"[KD] 加载学生模型: {student_model_name}")
     payload = torch.load(labels_path)
     kd_prompts = payload.get("prompts", [])
     kd_labels = payload.get("labels", [])
@@ -215,6 +215,7 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     logging.info(f"[KD] 学生模型已加载完毕: {model_name_to_use}")
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
+        logging.info("[KD] 学生模型遗忘层已禁用")
     except Exception:
         pass
     if student_init_ckpt:
