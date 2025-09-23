@@ -84,11 +84,12 @@ class GenerativeFlorenceModel(nn.Module):
             return texts_out
     
         def loss_on_batch(self, images, texts, targets):
-            print("Targets example:", targets[:5])
-            print("Texts example:", texts[:2])
+            # 调试打印
+            print("Targets example:", targets[:1])
+            print("Texts example:", texts[:1])
             print("Batch size:", len(images), len(texts), len(targets))
-            targets_tensor = torch.tensor(targets)
-            print("KD labels min:", targets_tensor.min().item(), "max:", targets_tensor.max().item())
+
+            # 保证类型统一
             if isinstance(images, Image.Image):
                 images = [images]
             if isinstance(texts, str):
@@ -96,36 +97,49 @@ class GenerativeFlorenceModel(nn.Module):
             if isinstance(targets, str):
                 targets = [targets]
             assert len(images) == len(texts) == len(targets), "Florence.loss_on_batch: 批大小不一致"
-    
-            # 拼接prompt+target
+
+            # 拼接 prompt + target
             full_texts = [p + t for p, t in zip(texts, targets)]
-            # Florence推荐padding方式
-            max_length = 1024  # Florence-2-base推荐最大长度
+
+            # Florence 推荐 padding
+            max_length = 1024
             inputs = self.processor(
                 text=full_texts,
                 images=images,
                 return_tensors="pt",
                 padding="max_length",
+                truncation=True,
                 max_length=max_length,
             )
+
             input_ids = inputs["input_ids"].to(self.device)
             pixel_values = inputs["pixel_values"].to(self.device, dtype=self.torch_dtype)
             attention_mask = inputs["attention_mask"].to(self.device)
-    
-            # 屏蔽prompt部分loss
+
+            # 构造 labels，屏蔽 prompt 部分 loss
             labels = input_ids.clone()
             for i, prompt in enumerate(texts):
-                prompt_ids = self.processor(text=prompt, images=[images[i]], return_tensors="pt", padding="max_length", max_length=max_length)["input_ids"][0]
-                labels[i, :len(prompt_ids)] = -100
-    
+                prompt_ids = self.processor(
+                    text=prompt,
+                    images=[images[i]],
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_length
+                )["input_ids"][0]
+                labels[i, :len(prompt_ids)] = -100  # -100 会被 CrossEntropyLoss 忽略
+
+            # 前向计算
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
                 labels=labels,
             )
+
             loss = outputs.loss
             return loss
+
 class GenerativeQwenVLModel(nn.Module):
     """
     1. generate: 生成
