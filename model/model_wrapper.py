@@ -113,8 +113,6 @@ class GenerativeFlorenceModel(nn.Module):
 
             # 构造 labels，屏蔽 prompt 部分 loss
             labels = input_ids.clone()
-            if (labels != -100).sum().item() == 0:
-                logging.warning("⚠️ Warning: labels 全是 -100，loss 会是 NaN")
             for i, prompt in enumerate(texts):
                 prompt_ids = self.processor(
                     text=prompt,
@@ -126,6 +124,11 @@ class GenerativeFlorenceModel(nn.Module):
                 )["input_ids"][0]
                 labels[i, :len(prompt_ids)] = -100  # -100 会被 CrossEntropyLoss 忽略
 
+            # 检查 labels 是否全是 -100
+            valid_tokens = (labels != -100).sum().item()
+            if valid_tokens == 0:
+                print("⚠️ Warning: labels 全是 -100，loss 会变 NaN")
+
             # 前向计算
             outputs = self.model(
                 input_ids=input_ids,
@@ -135,6 +138,17 @@ class GenerativeFlorenceModel(nn.Module):
             )
 
             loss = outputs.loss
+
+            # NaN 诊断
+            if torch.isnan(loss):
+                print("⚠️ NaN loss detected!")
+                print("  logits min/max:", outputs.logits.min().item(), outputs.logits.max().item())
+                print("  labels valid tokens:", valid_tokens)
+                print("  input_ids shape:", input_ids.shape)
+                print("  pixel_values shape:", pixel_values.shape)
+                # 防止训练崩溃，返回 0 loss
+                loss = torch.tensor(0.0, requires_grad=True, device=self.device)
+
             return loss
 
 class GenerativeQwenVLModel(nn.Module):
