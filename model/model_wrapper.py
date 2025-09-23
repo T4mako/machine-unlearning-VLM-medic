@@ -84,11 +84,6 @@ class GenerativeFlorenceModel(nn.Module):
             return texts_out
     
         def loss_on_batch(self, images, texts, targets):
-            # 调试打印
-            print("Targets example:", targets[:1])
-            print("Texts example:", texts[:1])
-            print("Batch size:", len(images), len(texts), len(targets))
-
             # 保证类型统一
             if isinstance(images, Image.Image):
                 images = [images]
@@ -118,6 +113,8 @@ class GenerativeFlorenceModel(nn.Module):
 
             # 构造 labels，屏蔽 prompt 部分 loss
             labels = input_ids.clone()
+            if (labels != -100).sum().item() == 0:
+                logging.warning("⚠️ Warning: labels 全是 -100，loss 会是 NaN")
             for i, prompt in enumerate(texts):
                 prompt_ids = self.processor(
                     text=prompt,
