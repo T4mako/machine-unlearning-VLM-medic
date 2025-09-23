@@ -162,7 +162,7 @@ def precompute_af_nll_singleton(model_name: str, ckpt_af: str, forget_data, out_
 
 def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_ckpt: str, max_len: int, temperature: float):
     """仅加载一次教师模型，为给定数据集生成伪标签并保存到磁盘。"""
-    logging.info(f"[KD] 准备伪标签 -> {out_path}")
+    logging.info(f"[KD] {teacher_model_name} 模型准备伪标签 -> {out_path}")
     teacher = GenerativeQwenVLModel(model_name=teacher_model_name, use_fast=config.model.use_fast)
     try:
         teacher.enable_unlearning(False)
@@ -205,17 +205,21 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
 def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, student_model_name: str = None, student_init_ckpt: str = None):
     """仅加载一次学生模型，使用磁盘伪标签进行监督训练并保存checkpoint。"""
     logging.info(f"[KD] 加载学生模型: {student_model_name}")
+    logging.info(f"[KD] {student_model_name} 模型加载 payload: {labels_path}")
     payload = torch.load(labels_path)
+    logging.info(f"[KD] {student_model_name} 模型加载 prompt 和 label")
+    logging.info(f"[KD] 示例 prompt: {kd_prompts[0] if kd_prompts else '无'}")
+    logging.info(f"[KD] 示例 label: {kd_labels[0] if kd_labels else '无'}")
     kd_prompts = payload.get("prompts", [])
     kd_labels = payload.get("labels", [])
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
     model_name_to_use = student_model_name
-    student = GenerativeQwenVLModel(model_name=model_name_to_use, use_fast=config.model.use_fast)
+    student = GenerativeQwenVLModel(model_name=student_model_name, use_fast=config.model.use_fast,precision=config.model.precision,load_in_4bit=config.model.load_in_4bit)
     logging.info(f"[KD] 学生模型已加载完毕: {model_name_to_use}")
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
-        logging.info("[KD] 学生模型遗忘层已禁用")
+        logging.info(f"[KD] {student_model_name} 学生模型遗忘层已禁用")
     except Exception:
         pass
     if student_init_ckpt:
@@ -250,7 +254,7 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
             texts = [x["text"] for x in batch]
             targets = _get_kd_target_slice(i, min(i + B, n_items))
             assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
-            logging.info(f"[KD] 训练批次 {n_batches} | 样本数 {len(images)} | 目标数 {len(targets)}")
+            logging.info(f"[KD] 数据批次 {n_batches} | 样本数 {len(images)} | 目标数 {len(targets)}")
             loss = student.loss_on_batch(images, texts, targets)
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -281,19 +285,16 @@ def main():
     logging.info("程序启动中...")
 
     parser = argparse.ArgumentParser()
-    # 1) distill_an: 通过离线KD生成An
-    # 2) distill_af: 通过离线KD生成Af
-    # 3) precompute_gap: 计算目标差距 G = dis_Dn(AD, An, Dn)
-    # 4) precompute_af_nll: 预计算 Af 在 Df 的NLL缓存
-    # 5) train_with_af: 使用缓存的 G 与 Af-NLL 训练 A*
-
-    # parser.add_argument('--mode', choices=['distill_an', 'distill_af','precompute_gap', 'precompute_af_nll', 'train_with_af', ], default='precompute_gap',
-    #                     help='分批运行模式：precompute_gap=仅加载AD与An计算目标差距G；precompute_af_nll=仅加载Af预计算Df上的NLL缓存；train_with_af=仅加载A*并从缓存读取Af的NLL进行KGA训练；distill_an=离线KD训练An；distill_af=离线KD训练Af。')
     parser.add_argument('--mode', choices=[
-        'distill_an_labels', 'distill_an_train',
-        'distill_af_labels', 'distill_af_train',
-        'distill_an', 'distill_af',
-        'precompute_gap', 'precompute_af_nll', 'train_with_af',
+        'distill_an_labels', # 仅生成An的KD伪标签
+        'distill_an_train', # 仅用An伪标签训练学生
+        'distill_af_labels', # 仅生成Af的KD伪标签
+        'distill_af_train', # 仅用Af伪标签训练学生
+        'precompute_gap', # 仅加载AD与An计算G
+        'precompute_af_nll', # 仅加载Af预计算Df上的NLL缓存
+        'train_with_af', # 仅加载A*并从缓存读取Af的NLL进行KGA训练
+        'distill_an', 
+        'distill_af',
     ], default='precompute_gap',
         help='分批运行模式：distill_an_labels=仅生成An的KD伪标签；distill_an_train=仅用An伪标签训练学生；distill_af_labels=仅生成Af的KD伪标签；distill_af_train=仅用Af伪标签训练学生；precompute_gap=仅加载AD与An计算G；precompute_af_nll=仅加载Af预计算Df上的NLL缓存；train_with_af=仅加载A*并从缓存读取Af的NLL进行KGA训练；distill_an/ distill_af 为一键流程（先标签后训练）。')
     parser.add_argument('--baseline_gap', type=float, default=None, help='可选：覆盖 baseline_gap（当分批运行无法同时加载AD/An时可用）。')
@@ -308,8 +309,8 @@ def main():
         role = 'an' if args.mode == 'distill_an_labels' else 'af'
         dataset = dn_data if role == 'an' else forget_data
         labels_path = os.path.join('logs', f'{role}_kd_labels.pt')
-        teacher_model_name = (config.kd.teacher_model_name or config.model.model_name)
-        teacher_ckpt = (config.kd.teacher_ckpt or config.kga.ad_checkpoint)
+        teacher_model_name = config.kd.teacher_model_name
+        teacher_ckpt = (config.kd.teacher_ckpt or config.kga.ad_checkpoint) # 基础权重
         prepare_kd_labels(
             dataset=dataset,
             out_path=labels_path,
@@ -324,11 +325,11 @@ def main():
     # 拆分后的KD模式：只训练学生
     if args.mode in ("distill_an_train", "distill_af_train"):
         role = 'an' if args.mode == 'distill_an_train' else 'af'
+        logging.info(f"[KD] {role.upper()} 开始训练学生模型")
         dataset = dn_data if role == 'an' else forget_data
         labels_path = os.path.join('logs', f'{role}_kd_labels.pt')
         out_ckpt = (config.kd.an_out_ckpt if role == 'an' else config.kd.af_out_ckpt)
-        student_name = config.kd.student_model_name or config.model.model_name
-        logging.info(f"[KD] {role.upper()} 加载学生模型: {student_name}")
+        student_name = config.kd.student_model_name
         train_student_from_kd_labels(
             dataset=dataset,
             labels_path=labels_path,

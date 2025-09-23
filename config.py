@@ -37,7 +37,7 @@ class TrainConfig:
     batch_size: int = 1
     epochs: int = 100
     lr: float = 5e-4
-    log_interval: int = 5
+    log_interval: int = 5 
     debug_limit: Optional[int] = 50  # 仅跑前 N 条样本做热身，确认流程
     # === 新增：训练目标 & 冻结策略 ===
     objective: str = "kga"            # 训练目标："kga" 或 "eul"
@@ -67,7 +67,7 @@ class KGAConfig:
 @dataclass
 class KDConfig:
     kd_type: str = "hard"                        # "hard"=伪标签KD；"soft"=分布蒸馏（需额外实现与更高显存）
-    teacher_model_name: Optional[str] = None     # 若为None，默认使用 config.model.model_name
+    teacher_model_name: Optional[str] = "FreedomIntelligence/HuatuoGPT-Vision-7B-Qwen2.5VL"     # 若为None，默认使用 config.model.model_name
     student_model_name: Optional[str] = "Qwen/Qwen2-VL-2B-Instruct"     # 默认学生模型
     teacher_ckpt: Optional[str] = None           # 若为None，默认使用 config.kga.ad_checkpoint
     student_init_ckpt: Optional[str] = None      # 学生初始化权重（可选）

@@ -36,31 +36,54 @@ except Exception:
 
 class GenerativeQwenVLModel(nn.Module):
     """
-    HuatuoGPT-Vision-7B 基于 Qwen2-7B 进行训练，使用 LLaVA-v1.5 架构
-    用于KGA框架的image-text-to-text任务。
-    支持：
-    1. generate: 生成式推理
+    1. generate: 生成
     2. compute_nll: 计算给定target的负对数似然（用于KGA知识差距计算）
     3. forward: 返回包含logits的对象以兼容旧接口
-    另外：
-    - 提供 loss_on_batch 用于蒸馏训练（带梯度）。
+    4. loss_on_batch: 用于蒸馏训练（带梯度）。
     """
 
-    def __init__(self, model_name: str = config.model.model_name, use_fast: bool = config.model.use_fast):
+    def __init__(
+        self,
+        model_name: str,
+        use_fast: bool = config.model.use_fast,
+        # 可选的实例级低显存/LoRA/遗忘层配置（若为None则回退到全局config.model）
+        precision: Optional[str] = None, # 精度，默认全局config.model.precision
+        load_in_4bit: Optional[bool] = None, # 是否加载4bit模型
+        gradient_checkpointing: Optional[bool] = None, # 是否开启梯度检查点
+        lora_enabled: Optional[bool] = None, # 是否开启LoRA
+        lora_r: Optional[int] = None, # LoRA的秩，默认全局config.model.lora_r
+        lora_alpha: Optional[int] = None, # LoRA的缩放系数，默认全局config.model.lora_alpha
+        lora_dropout: Optional[float] = None, # LoRA的dropout率，默认全局config.model.lora_dropout
+        lora_target_modules: Optional[List[str]] = None, # LoRA的目标模块，默认全局config.model.lora_target_modules
+        enable_unl: Optional[bool] = None, # 是否开启遗忘层，默认全局config.model.enable_unl
+        unl_hidden_dim: Optional[int] = None, # 遗忘层的隐藏层维度，默认全局config.model.unl_hidden_dim
+        max_image_res: Optional[int] = None, # 最大图片分辨率，默认全局config.model.max_image_res
+    ):
         super().__init__()
         # 设备选择：优先使用GPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 将配置固化到实例（None 则取全局默认）
+        self.precision = (precision or config.model.precision)
+        self.load_in_4bit = bool(config.model.load_in_4bit if load_in_4bit is None else load_in_4bit)
+        self.gradient_checkpointing = bool(config.model.gradient_checkpointing if gradient_checkpointing is None else gradient_checkpointing)
+        self.lora_enabled = bool(config.model.lora_enabled if lora_enabled is None else lora_enabled)
+        self.lora_r = int(config.model.lora_r if lora_r is None else lora_r)
+        self.lora_alpha = int(config.model.lora_alpha if lora_alpha is None else lora_alpha)
+        self.lora_dropout = float(config.model.lora_dropout if lora_dropout is None else lora_dropout)
+        self.lora_target_modules = list(config.model.lora_target_modules if lora_target_modules is None else lora_target_modules)
+        self.enable_unl_cfg = bool(config.model.enable_unl if enable_unl is None else enable_unl)
+        self.unl_hidden_dim_cfg = int(config.model.unl_hidden_dim if unl_hidden_dim is None else unl_hidden_dim)
+        self.max_image_res = int(config.model.max_image_res if max_image_res is None else max_image_res)
         self.max_seq_len = config.model.max_seq_len  # 针对对话式长文本设置上下文上限
 
         self.text_only: bool = False
-        # 按配置选择精度
-        dtype = torch.bfloat16 if str(getattr(config.model, "precision", "bf16")).lower() == "bf16" else torch.float16
+        # 按实例配置选择精度
+        dtype = torch.bfloat16 if str(self.precision).lower() == "bf16" else torch.float16
 
         # 优先加载多模态生成模型
         self.model = None
         self.processor = None
-        # 4-bit 量化与设备映射配置
-        load_in_4bit = bool(getattr(config.model, "load_in_4bit", False))
+        # 4-bit 量化与设备映射配置（device_map/offload_folder 仍使用全局）
         device_map = getattr(config.model, "device_map", "auto")
         offload_folder = getattr(config.model, "offload_folder", "offload")
 
@@ -70,7 +93,7 @@ class GenerativeQwenVLModel(nn.Module):
             "device_map": device_map,
             "offload_folder": offload_folder,
         }
-        if load_in_4bit and (bnb is not None):
+        if self.load_in_4bit and (bnb is not None):
             common_kwargs.update({
                 "load_in_4bit": True,
                 "bnb_4bit_use_double_quant": True,
@@ -123,10 +146,10 @@ class GenerativeQwenVLModel(nn.Module):
                 logging.info("模型已加载（文本-only CausalLM）")
 
         # ===== 遗忘层 =====
-        logging.info("初始化遗忘层...，但并未训练")
+        logging.info(f"模型{model_name}初始化遗忘层...，但并未训练")
         self.hidden_size = int(getattr(self.model.config, "hidden_size", getattr(getattr(self.model, "config", object()), "hidden_size", 0)))
-        self.unl_enabled: bool = bool(getattr(config.model, "enable_unl", False))
-        self.unl_hidden_dim: int = int(getattr(config.model, "unl_hidden_dim", 128))
+        self.unl_enabled: bool = bool(self.enable_unl_cfg)
+        self.unl_hidden_dim: int = int(self.unl_hidden_dim_cfg)
         self.unlearning_layer: Optional[UnlearningLayer] = None
         if self.unl_enabled and self.hidden_size > 0:
             self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
@@ -136,19 +159,19 @@ class GenerativeQwenVLModel(nn.Module):
             self.model.config.use_cache = False  # 训练禁用 KV cache
         except Exception:
             pass
-        if bool(getattr(config.model, "gradient_checkpointing", False)):
+        if self.gradient_checkpointing:
             try:
                 self.model.gradient_checkpointing_enable()
             except Exception:
                 pass
 
         # LoRA 仅在启用时注入，并且只训练 LoRA 权重（其余冻结）
-        if bool(getattr(config.model, "lora_enabled", False)) and (LoraConfig is not None) and (get_peft_model is not None):
+        if self.lora_enabled and (LoraConfig is not None) and (get_peft_model is not None):
             lora_cfg = LoraConfig(
-                r=int(getattr(config.model, "lora_r", 16)),
-                lora_alpha=int(getattr(config.model, "lora_alpha", 32)),
-                lora_dropout=float(getattr(config.model, "lora_dropout", 0.05)),
-                target_modules=list(getattr(config.model, "lora_target_modules", [])),
+                r=int(self.lora_r),
+                lora_alpha=int(self.lora_alpha),
+                lora_dropout=float(self.lora_dropout),
+                target_modules=list(self.lora_target_modules),
                 bias="none",
                 task_type="CAUSAL_LM",
             )
@@ -257,7 +280,7 @@ class GenerativeQwenVLModel(nn.Module):
             return self._ensure_pil_list(x)[0] if not isinstance(x, list) else [self._ensure_pil_list(i)[0] for i in x]
 
         def maybe_resize(pil):
-            max_res = int(getattr(config.model, "max_image_res", 0))
+            max_res = int(self.max_image_res)
             if max_res <= 0:
                 return pil
             try:
@@ -364,170 +387,80 @@ class GenerativeQwenVLModel(nn.Module):
                 convs_full, tokenize=False, add_generation_prompt=False
             )
             inputs = self.processor(
-                text=full_texts, images=images_per_sample,
-                return_tensors="pt", padding=True, truncation=True, max_length=self.max_seq_len
-            )
-            # 构造labels：遮住prompt部分
-            input_ids = inputs["input_ids"]
-            labels = torch.full_like(input_ids, -100)
-            pad_id = self.processor.tokenizer.pad_token_id
-            if pad_id is None:
-                pad_id = self.processor.tokenizer.eos_token_id
-            for i, pids in enumerate(prompt_token_ids_list):
-                prompt_len = len(pids)
-                row = input_ids[i]
-                non_pad = (row != pad_id).nonzero(as_tuple=False).squeeze(-1)
-                if non_pad.numel() == 0:
-                    continue
-                last_valid = int(non_pad[-1])
-                start = min(prompt_len, last_valid + 1)
-                labels[i, start:last_valid + 1] = row[start:last_valid + 1]
-            inputs["labels"] = labels
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(self.device)
-            return inputs
-
-    def generate(self, images, texts, max_length: int = 100, temperature: float = 0.7, do_sample: bool = True):
-        """生成式推理，支持原生多图输入；文本-only 模型忽略 images。"""
-        self.model.eval()
-        if self.text_only:
-            if isinstance(texts, str):
-                texts = [texts]
-            tokenizer = self.processor  # type: ignore
-            enc = tokenizer(
-                texts,
+                text=full_texts,
+                images=images_per_sample,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
                 max_length=self.max_seq_len,
             )
-            for k, v in enc.items():
+            # 3) 将 prompt 部分 labels 置 -100
+            labels = inputs.get("labels", None)
+            input_ids = inputs.get("input_ids", None)
+            if (labels is None) and (input_ids is not None):
+                labels = input_ids.clone()
+            if labels is not None:
+                for b_idx, prompt_ids in enumerate(prompt_token_ids_list):
+                    n_prompt = len(prompt_ids)
+                    labels[b_idx, :n_prompt] = -100
+                inputs["labels"] = labels
+            for k, v in inputs.items():
                 if isinstance(v, torch.Tensor):
-                    enc[k] = v.to(self.device)
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **enc,
-                    max_length=max_length,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            return decoded
+                    inputs[k] = v.to(self.device)
+            return inputs
 
-        # 多模态路径
-        # 构造用户轮对话模板（多图）
-        if isinstance(texts, str):
-            texts = [texts]
-        images_per_sample = self._ensure_pil_per_sample(images)
-        B = len(images_per_sample)
-        if len(texts) == 1 and B > 1:
-            texts = [texts[0] for _ in range(B)]
-        if len(texts) != B:
-            raise ValueError(f"Texts and images batch size mismatch: {len(texts)} vs {B}")
-
-        convs_user_only = []
-        for t, imgs in zip(texts, images_per_sample):
-            content = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
-            convs_user_only.append([{ "role": "user", "content": content }])
-
-        prompt_texts = self.processor.apply_chat_template(
-            convs_user_only, tokenize=False, add_generation_prompt=True
+    def generate(self, images, texts: Union[str, List[str]], max_new_tokens: int = 64, do_sample: bool = True, temperature: float = 0.7):
+        inputs = self._prepare_inputs(images, texts, targets=None)
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
         )
-        inputs = self.processor(
-            text=prompt_texts, images=images_per_sample,
-            return_tensors="pt", padding=True, truncation=True, max_length=self.max_seq_len
-        )
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                inputs[k] = v.to(self.device)
-        
         with torch.no_grad():
-            # 生成阶段不应用遗忘层，保持原生生成行为（如有需要可开启）
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                temperature=temperature,
-                do_sample=do_sample,
-                pad_token_id=self.processor.tokenizer.eos_token_id
-            )
-        
-        # 解码生成的文本（去除输入部分，按每条样本的prompt长度切分更稳妥）
-        prompt_token_ids_list = self.processor.apply_chat_template(
-            convs_user_only, tokenize=True, add_generation_prompt=True
-        )
-        if isinstance(prompt_token_ids_list[0], int):
-            prompt_token_ids_list = [prompt_token_ids_list]
-        decoded = []
-        for i in range(generated_ids.size(0)):
-            start = len(prompt_token_ids_list[i])
-            text = self.processor.tokenizer.decode(
-                generated_ids[i, start:], skip_special_tokens=True
-            )
-            decoded.append(text)
-        return decoded
+            out = self.model.generate(**inputs, **gen_kwargs)
+        if self.text_only:
+            # 文本-only，直接解码
+            tokenizer = self.processor  # type: ignore
+            return tokenizer.batch_decode(out, skip_special_tokens=True)
+        # 多模态
+        return self.processor.batch_decode(out, skip_special_tokens=True)
 
-    def compute_nll(self, images, texts, targets):
-        """计算给定target的负对数似然，用于KGA/EUL知识差距计算。若开启遗忘层，则基于遗忘层后的logits计算。"""
-        self.model.eval()
+    def compute_nll(self, images, texts: Union[str, List[str]], targets: Union[str, List[str]]):
+        """返回负对数似然（越小越好）"""
         inputs = self._prepare_inputs(images, texts, targets)
-        
         with torch.no_grad():
-            if self.text_only:
-                outputs = self.model(**inputs)
-                loss = outputs.loss
-            else:
-                if self.unl_enabled and (self.unlearning_layer is not None):
-                    outputs = self.model(**inputs, output_hidden_states=True)
-                    last_hidden = outputs.hidden_states[-1]
-                    last_hidden = self._apply_unl(last_hidden)
-                    lm_head = self.model.get_output_embeddings()
-                    logits = lm_head(last_hidden)
-                    labels = inputs["labels"]
-                    # 与HF一致：shift一位
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    loss = F.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
-                        ignore_index=-100
-                    )
-                else:
-                    outputs = self.model(**inputs)
-                    loss = outputs.loss  # 已经是NLL
+            out = self.model(**inputs)
+            logits = out.logits  # [B, T, V]
+            labels = inputs["labels"]  # [B, T]
+            # 交叉熵：仅计算 labels != -100 的位置
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction="mean")
         return loss
 
-    # 新增：兼容旧接口的 forward（返回含 .loss 的对象）
-    def forward(self, images, texts, targets=None):
-        loss = self.loss_on_batch(images, texts, targets)
-        return SimpleNamespace(loss=loss)
-
-    # 新增：训练用，返回带梯度的loss
-    def loss_on_batch(self, images, texts, targets):
+    def forward(self, images=None, texts: Union[str, List[str]] = None, targets: Union[str, List[str]] = None):
+        """兼容旧训练接口：返回包含 loss 的对象（SimpleNamespace），以便 trainer 统一处理。"""
+        if texts is None:
+            raise ValueError("texts 不能为空")
         inputs = self._prepare_inputs(images, texts, targets)
-        if self.text_only:
-            outputs = self.model(**inputs)
-            return outputs.loss
-        else:
-            if self.unl_enabled and (self.unlearning_layer is not None):
-                outputs = self.model(**inputs, output_hidden_states=True)
-                last_hidden = outputs.hidden_states[-1]
-                last_hidden = self._apply_unl(last_hidden)
-                lm_head = self.model.get_output_embeddings()
-                logits = lm_head(last_hidden)
-                labels = inputs["labels"]
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100
-                )
-                return loss
-            else:
-                outputs = self.model(**inputs)
-                return outputs.loss
+        out = self.model(**inputs)
+        logits = out.logits
+        labels = inputs.get("labels")
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction="mean")
+        return SimpleNamespace(logits=logits, loss=loss)
+
+    def loss_on_batch(self, images, texts: Union[str, List[str]], targets: Union[str, List[str]]):
+        inputs = self._prepare_inputs(images, texts, targets)
+        out = self.model(**inputs)
+        logits = out.logits  # [B, T, V]
+        labels = inputs["labels"]  # [B, T]
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction="mean")
 
     # 为兼容性保留的别名方法
     def get_fused_features(self, images, texts):
