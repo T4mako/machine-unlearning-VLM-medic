@@ -45,6 +45,7 @@ class GenerativeFlorenceModel(nn.Module):
                 self.model_name,
                 torch_dtype=self.torch_dtype,
                 trust_remote_code=True,
+                attn_implementation="eager",
             ).to(self.device)
             self.processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
     
