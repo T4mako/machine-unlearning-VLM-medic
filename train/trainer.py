@@ -41,7 +41,7 @@ class KGATrainer:
         self.precision = str(getattr(config.model, "precision", "bf16")).lower()
         self._amp_enabled = (torch.cuda.is_available() and (autocast is not None) and (self.precision in ["bf16", "fp16"]))
         self._amp_dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
-        self.scaler = GradScaler(enabled=(self._amp_enabled and self.precision == "fp16")) if GradScaler is not None else None
+        self.scaler = GradScaler(device_type='cuda', enabled=(self._amp_enabled and self.precision == "fp16")) if GradScaler is not None else None
 
         # 梯度累积
         self.grad_accum_steps = max(1, int(getattr(config.train, "gradient_accumulation_steps", 1)))
@@ -200,11 +200,7 @@ class KGATrainer:
 
                 # 前向与损失构造（AMP）
                 if self._amp_enabled and (autocast is not None):
-                    acm = autocast('cuda', dtype=self._amp_dtype)
-                else:
-                    # 上下文管理器的空实现
-                    from contextlib import nullcontext
-                    acm = nullcontext()
+                    acm = autocast(device_type='cuda', dtype=self._amp_dtype)
                 with acm:
                     if self.objective == "eul":
                         # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
