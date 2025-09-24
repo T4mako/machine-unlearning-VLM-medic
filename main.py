@@ -215,7 +215,7 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
     model_name_to_use = student_model_name
-    student = GenerativeFlorenceModel(model_name=student_model_name)
+    student = GenerativeQwenVLModel(model_name=student_model_name, use_fast=config.model.use_fast,load_in_4bit=True,lora_enabled=True)
     logging.info(f"[KD] 学生模型已加载完毕: {model_name_to_use}")
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
