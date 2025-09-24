@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from typing import List, Dict, Optional
 from config import config
 from model.model_wrapper import GenerativeQwenVLModel
+from torchvision.transforms import ToTensor
+
 
 # 可选：bitsandbytes 8-bit 优化器
 try:
@@ -32,6 +34,9 @@ except Exception:
 #                 yield
 #             return dummy()
 from torch.amp import autocast as _autocast, GradScaler  # torch>=2.0
+
+
+to_tensor = ToTensor()
 
 
 class KGATrainer:
@@ -221,8 +226,8 @@ class KGATrainer:
             accum = 0
             for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
                 # 确保输入数据启用梯度
-                images = [x.requires_grad() for x in images]
-                texts = [x.requires_grad() for x in texts]
+                images = [to_tensor(x).requires_grad_() if not isinstance(x, torch.Tensor) else x.requires_grad_() for x in images]
+                texts = [to_tensor(x).requires_grad_() if not isinstance(x, torch.Tensor) else x.requires_grad_() for x in texts]
                 self.A_star.train()
 
                 # 前向与损失构造（AMP）
