@@ -52,7 +52,7 @@ class KGATrainer:
 
         # 训练精度与AMP
         self.precision = str(getattr(config.model, "precision", "bf16")).lower()
-        self._amp_enabled = (torch.cuda.is_available() and (autocast is not None) and (self.precision in ["bf16", "fp16"]))
+        self._amp_enabled = (torch.cuda.is_available() and (_autocast is not None) and (self.precision in ["bf16", "fp16"]))
         self._amp_dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
         self.scaler = GradScaler(enabled=(self._amp_enabled and self.precision == "fp16")) if GradScaler is not None else None
 
