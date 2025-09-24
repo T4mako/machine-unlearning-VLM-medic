@@ -352,10 +352,24 @@ class KGATrainer:
         print("[KGA] Training finished.")
 
 def process_images(images):
-    """递归处理嵌套列表中的图片，将 PIL.Image 转换为 torch.Tensor 并启用 requires_grad。"""
+    """递归处理嵌套列表中的图片，将 PIL.Image 或 ndarray 转换为 torch.Tensor 并启用 requires_grad。"""
     if isinstance(images, list):
         return [process_images(x) for x in images]  # 递归处理嵌套列表
     elif isinstance(images, torch.Tensor):
         return images.requires_grad_()  # 如果是 Tensor，启用 requires_grad
     else:
         return to_tensor(images).requires_grad_()  # 如果是 PIL.Image 或 ndarray，转换为 Tensor
+
+def process_texts(texts):
+    """处理文本数据，将字符串转换为张量并启用 requires_grad。"""
+    processed_texts = []
+    for text in texts:
+        if isinstance(text, torch.Tensor):
+            processed_texts.append(text.requires_grad_())
+        elif isinstance(text, str):
+            # 假设文本需要转换为张量，这里可以根据实际需求调整
+            tensor = torch.tensor([ord(c) for c in text], dtype=torch.float32)
+            processed_texts.append(tensor.requires_grad_())
+        else:
+            raise TypeError(f"Unsupported text type: {type(text)}")
+    return processed_texts
