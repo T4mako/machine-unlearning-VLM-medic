@@ -221,8 +221,8 @@ class KGATrainer:
             accum = 0
             for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
                 # 确保输入数据启用梯度
-                images = [x.requires_grad_() for x in images]
-                texts = [x.requires_grad_() for x in texts]
+                images = [x.requires_grad() for x in images]
+                texts = [x.requires_grad() for x in texts]
                 self.A_star.train()
 
                 # 前向与损失构造（AMP）
