@@ -87,6 +87,12 @@ class GenerativeQwenVLModel(nn.Module):
         device_map = getattr(config.model, "device_map", "auto")
         offload_folder = getattr(config.model, "offload_folder", "offload")
 
+
+        try:
+            self.model.config.use_cache = False
+        except Exception:
+            pass
+
         common_kwargs = {
             "trust_remote_code": True,
             "torch_dtype": dtype,
@@ -210,7 +216,7 @@ class GenerativeQwenVLModel(nn.Module):
         B, T, H = last_hidden.shape
         x = last_hidden.reshape(-1, H)
         y = self.unlearning_layer(x)
-        return y.reshape(B, T, H)
+        return y.reshape(B, T, H).clone()  # 确保输出连接到计算图
 
     # ===== 图像预处理保持不变（文本-only 时会忽略） =====
     def _ensure_pil_list(self, x):

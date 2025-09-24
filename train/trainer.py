@@ -220,10 +220,15 @@ class KGATrainer:
 
             accum = 0
             for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
+                # 确保输入数据启用梯度
+                images = [x.requires_grad_() for x in images]
+                texts = [x.requires_grad_() for x in texts]
                 self.A_star.train()
 
                 # 前向与损失构造（AMP）
                 with _autocast(device_type="cuda", dtype=self._amp_dtype):
+                    out_f = self.A_star.forward(images, texts, targets)
+                    loss = out_f.loss  # 需要梯度
                     if self.objective == "eul":
                         logging.info(f"[EUL] 训练批次 {step}/{steps_total}，当前gap: {gap_star.item():.6f}")
                         # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
