@@ -38,7 +38,7 @@ class TrainConfig:
     epochs: int = 100
     lr: float = 5e-4
     log_interval: int = 5 
-    debug_limit: Optional[int] = 500  # 仅跑前 N 条样本做热身，确认流程
+    debug_limit: Optional[int] = 50  # 仅跑前 N 条样本做热身，确认流程
     # === 新增：训练目标 & 冻结策略 ===
     objective: str = "kga"            # 训练目标："kga" 或 "eul"
     freeze_backbone: bool = True      # 启用遗忘层时，是否冻结主干参数，仅训练遗忘层

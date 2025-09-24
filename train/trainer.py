@@ -1,3 +1,4 @@
+import logging
 import math
 import time
 import torch
@@ -43,13 +44,22 @@ class KGATrainer:
         
         # 根据配置选择优化参数（是否只训练遗忘层）
         if bool(getattr(config.train, "freeze_backbone", True)) and len(self.A_star.get_unlearning_parameters()) > 0:
+            logging.info(f"[Trainer] 冻结主干，仅训练遗忘层，参数数量: {len(self.A_star.get_unlearning_parameters())}")
             # 冻结主干，仅训练遗忘层
             for p in self.A_star.model.parameters():
                 p.requires_grad = False
+            # 确保遗忘层参数可训练
+            for p in self.A_star.get_unlearning_parameters():
+                p.requires_grad = True
             opt_params = list(self.A_star.get_unlearning_parameters())
+            logging.info("[DEBUG] 冻结后遗忘层参数 requires_grad 状态:")
+            for i, p in enumerate(opt_params):
+                logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
         else:
             opt_params = list(self.A_star.parameters())
-
+            logging.info("[DEBUG] 训练全部参数，数量: %d", len(opt_params))
+            for i, p in enumerate(opt_params):
+                logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
         # 训练精度与AMP
         self.precision = str(getattr(config.model, "precision", "bf16")).lower()
         self._amp_enabled = (torch.cuda.is_available() and (_autocast is not None) and (self.precision in ["bf16", "fp16"]))
@@ -214,6 +224,7 @@ class KGATrainer:
                 # 前向与损失构造（AMP）
                 with get_autocast(self._amp_dtype):
                     if self.objective == "eul":
+                        logging.info(f"[EUL] 训练批次 {step}/{steps_total}，当前gap: {gap_star.item():.6f}")
                         # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
                         out_f = self.A_star.forward(images, texts, targets)
                         nll_astar_f = out_f.loss  # 需要梯度
@@ -238,6 +249,7 @@ class KGATrainer:
                         loss = L_forget + self.alpha * L_retain
 
                     else:
+                        logging.info(f"[KGA] 训练批次 {step}/{steps_total}，当前gap: {gap_star.item():.6f}")
                         # KGA：让 A* 与 Af 在 Df 的gap 接近 AD 与 An 在 Dn 的gap
                         out_f = self.A_star.forward(images, texts, targets)
                         nll_astar = out_f.loss  # 需要梯度
