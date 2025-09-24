@@ -13,11 +13,12 @@ except Exception:
     bnb = None  # type: ignore
 
 try:
-    from torch.amp import autocast, GradScaler
-except Exception:
-    autocast = None  # type: ignore
-    GradScaler = None  # type: ignore
-
+    from torch.cuda.amp import autocast, GradScaler
+except ImportError:
+    try:
+        from torch.amp import autocast, GradScaler  # 兼容 torch>=2.0
+    except ImportError:
+        autocast, GradScaler = None, None
 
 class KGATrainer:
     def __init__(self, A_star: GenerativeQwenVLModel,
@@ -41,7 +42,7 @@ class KGATrainer:
         self.precision = str(getattr(config.model, "precision", "bf16")).lower()
         self._amp_enabled = (torch.cuda.is_available() and (autocast is not None) and (self.precision in ["bf16", "fp16"]))
         self._amp_dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
-        self.scaler = GradScaler(device_type='cuda', enabled=(self._amp_enabled and self.precision == "fp16")) if GradScaler is not None else None
+        self.scaler = GradScaler(enabled=(self._amp_enabled and self.precision == "fp16")) if GradScaler is not None else None
 
         # 梯度累积
         self.grad_accum_steps = max(1, int(getattr(config.train, "gradient_accumulation_steps", 1)))
