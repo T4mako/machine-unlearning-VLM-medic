@@ -1,6 +1,6 @@
 from venv import logger
 from data.load_PubMedVision import prepare_datasets
-from model.model_wrapper import GenerativeQwenVLModel, GenerativeFlorenceModel
+from model.model_wrapper import GenerativeQwenVLModel
 from train.trainer import KGATrainer
 from eval import kga_eval
 from config import config
