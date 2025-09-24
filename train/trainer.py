@@ -13,7 +13,7 @@ except Exception:
     bnb = None  # type: ignore
 
 try:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import autocast, GradScaler
 except Exception:
     autocast = None  # type: ignore
     GradScaler = None  # type: ignore
