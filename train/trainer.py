@@ -226,7 +226,7 @@ class KGATrainer:
             accum = 0
             for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
                 # 确保输入数据启用梯度
-                images = [to_tensor(x).requires_grad_() if not isinstance(x, torch.Tensor) else x.requires_grad_() for x in images]
+                images = process_images(images)
                 texts = [to_tensor(x).requires_grad_() if not isinstance(x, torch.Tensor) else x.requires_grad_() for x in texts]
                 self.A_star.train()
 
@@ -350,3 +350,12 @@ class KGATrainer:
                     break
 
         print("[KGA] Training finished.")
+
+def process_images(images):
+    """递归处理嵌套列表中的图片，将 PIL.Image 转换为 torch.Tensor 并启用 requires_grad。"""
+    if isinstance(images, list):
+        return [process_images(x) for x in images]  # 递归处理嵌套列表
+    elif isinstance(images, torch.Tensor):
+        return images.requires_grad_()  # 如果是 Tensor，启用 requires_grad
+    else:
+        return to_tensor(images).requires_grad_()  # 如果是 PIL.Image 或 ndarray，转换为 Tensor
