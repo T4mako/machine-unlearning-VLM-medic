@@ -180,7 +180,7 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
     all_labels = []
     for images, texts, _ in _iter_batches(dataset, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
         assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
-        gens = teacher.generate(images, texts, max_length=max_len, temperature=temperature)
+        gens = teacher.generate(images, texts, temperature=temperature)
         all_prompts.extend(texts)
         all_labels.extend(gens)
     # 保存

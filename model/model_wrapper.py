@@ -525,7 +525,7 @@ class GenerativeQwenVLModel(nn.Module):
                     inputs[k] = v.to(self.device)
             return inputs
 
-    def generate(self, images, texts: Union[str, List[str]], max_new_tokens: int = 64, do_sample: bool = True, temperature: float = 0.7):
+    def generate(self, images, texts: Union[str, List[str]], max_new_tokens: int = 128, do_sample: bool = True, temperature: float = 0.7):
         inputs = self._prepare_inputs(images, texts, targets=None)
         gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
