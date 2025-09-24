@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import logging
 
 class UnlearningLayer(nn.Module):
     """轻量级的遗忘层，即“记忆过滤眼镜”"""
@@ -18,4 +18,14 @@ class UnlearningLayer(nn.Module):
 
     def forward(self, x):
         # x: 多模态融合后的表示
-        return self.mlp(x) + self.residual(x)
+        mlp_out = self.mlp(x)
+        residual_out = self.residual(x)
+        out = mlp_out + residual_out
+        # 打印遗忘层参数和输出
+        logging.info(f"[DEBUG][UnlearningLayer] mlp.weight: {[p.data for p in self.mlp.parameters()]}")
+        logging.info(f"[DEBUG][UnlearningLayer] residual.weight: {self.residual.weight.data}")
+        logging.info(f"[DEBUG][UnlearningLayer] input: {x}")
+        logging.info(f"[DEBUG][UnlearningLayer] mlp_out: {mlp_out}")
+        logging.info(f"[DEBUG][UnlearningLayer] residual_out: {residual_out}")
+        logging.info(f"[DEBUG][UnlearningLayer] output: {out}")
+        return out
