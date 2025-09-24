@@ -82,8 +82,8 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
         except Exception as e:
             logging.warning(f"[GAP] 加载 AD checkpoint 失败，将使用预训练权重: {e}")
     nll_ad = []
-    for images, texts, _ in _iter_batches(dn_data, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
-        nll = AD.compute_nll(images, texts)
+    for images, texts, targets in _iter_batches(dn_data, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
+        nll = AD.compute_nll(images, texts, targets)
         nll_ad.append(float(nll))
     try:
         del AD
