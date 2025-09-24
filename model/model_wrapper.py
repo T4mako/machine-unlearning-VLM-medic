@@ -146,13 +146,26 @@ class GenerativeQwenVLModel(nn.Module):
                 logging.info("模型已加载（文本-only CausalLM）")
 
         # ===== 遗忘层 =====
-        logging.info(f"模型{model_name}初始化遗忘层...，但并未训练")
-        self.hidden_size = int(getattr(self.model.config, "hidden_size", getattr(getattr(self.model, "config", object()), "hidden_size", 0)))
+        logging.info(f"模型{model_name}初始化遗忘层...")
+        self.hidden_size = int(getattr(self.model.config, "hidden_size", 1024))
         self.unl_enabled: bool = bool(self.enable_unl_cfg)
         self.unl_hidden_dim: int = int(self.unl_hidden_dim_cfg)
         self.unlearning_layer: Optional[UnlearningLayer] = None
         if self.unl_enabled and self.hidden_size > 0:
             self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+
+        # 冻结主干模型参数，只训练遗忘层
+        if self.unl_enabled and self.unlearning_layer is not None:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            for param in self.unlearning_layer.parameters():
+                param.requires_grad = True
+
+        # 禁用 use_cache 以兼容梯度检查点
+        try:
+            self.model.config.use_cache = False
+        except Exception:
+            pass
 
         # ===== 训练显存优化：LoRA & 梯度检查点 =====
         try:
@@ -437,6 +450,7 @@ class GenerativeQwenVLModel(nn.Module):
 
     def forward(self, images=None, texts: Union[str, List[str]] = None, targets: Union[str, List[str]] = None):
         """兼容旧训练接口：返回包含 loss 的对象（SimpleNamespace），以便 trainer 统一处理。"""
+        
         if texts is None:
             raise ValueError("texts 不能为空")
         inputs = self._prepare_inputs(images, texts, targets)

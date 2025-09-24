@@ -14,23 +14,24 @@ except Exception:
     bnb = None  # type: ignore
 
 # AMP 自动精度上下文兼容封装
-try:
-    from torch.cuda.amp import autocast as _autocast, GradScaler
-    def get_autocast(dtype):
-        return _autocast(dtype=dtype)
-except ImportError:
-    try:
-        from torch.amp import autocast as _autocast, GradScaler  # torch>=2.0
-        def get_autocast(dtype):
-            return _autocast(device_type="cuda", dtype=dtype)
-    except ImportError:
-        GradScaler = None
-        def get_autocast(dtype):
-            from contextlib import contextmanager
-            @contextmanager
-            def dummy():
-                yield
-            return dummy()
+# try:
+#     from torch.cuda.amp import autocast as _autocast, GradScaler
+#     def get_autocast(dtype):
+#         return _autocast(dtype=dtype)
+# except ImportError:
+#     try:
+#         from torch.amp import autocast as _autocast, GradScaler  # torch>=2.0
+#         def get_autocast(dtype):
+#             return _autocast(device_type="cuda", dtype=dtype)
+#     except ImportError:
+#         GradScaler = None
+#         def get_autocast(dtype):
+#             from contextlib import contextmanager
+#             @contextmanager
+#             def dummy():
+#                 yield
+#             return dummy()
+from torch.amp import autocast as _autocast, GradScaler  # torch>=2.0
 
 
 class KGATrainer:
