@@ -223,7 +223,7 @@ class KGATrainer:
                 self.A_star.train()
 
                 # 前向与损失构造（AMP）
-                with _autocast(self._amp_dtype):
+                with _autocast(device_type="cuda", dtype=self._amp_dtype):
                     if self.objective == "eul":
                         logging.info(f"[EUL] 训练批次 {step}/{steps_total}，当前gap: {gap_star.item():.6f}")
                         # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
