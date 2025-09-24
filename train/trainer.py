@@ -200,7 +200,7 @@ class KGATrainer:
 
                 # 前向与损失构造（AMP）
                 if self._amp_enabled and (autocast is not None):
-                    acm = autocast(device_type="cuda", dtype=self._amp_dtype)
+                    acm = autocast('cuda', dtype=self._amp_dtype)
                 else:
                     # 上下文管理器的空实现
                     from contextlib import nullcontext
