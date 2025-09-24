@@ -227,7 +227,7 @@ class KGATrainer:
             for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
                 # 确保输入数据启用梯度
                 images = process_images(images)
-                texts = [to_tensor(x).requires_grad_() if not isinstance(x, torch.Tensor) else x.requires_grad_() for x in texts]
+                texts = process_texts(texts)
                 self.A_star.train()
 
                 # 前向与损失构造（AMP）
