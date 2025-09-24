@@ -442,7 +442,7 @@ class GenerativeQwenVLModel(nn.Module):
         # 文本-only 路径
         if self.text_only:
             return self._prepare_inputs_text_only(texts, targets)
-        logging.info(f"[KD] 文字样本数 {len(texts)} | 图片样本数 {len(images)} | 目标数 {len(targets)}")
+        # logging.info(f"[KD] 文字样本数 {len(texts)} | 图片样本数 {len(images)} | 目标数 {len(targets)}")
         # texts 统一成列表
         if isinstance(texts, str):
             texts = [texts]
