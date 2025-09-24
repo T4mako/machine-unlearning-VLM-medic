@@ -12,13 +12,25 @@ try:
 except Exception:
     bnb = None  # type: ignore
 
+# AMP 自动精度上下文兼容封装
 try:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.cuda.amp import autocast as _autocast, GradScaler
+    def get_autocast(dtype):
+        return _autocast(dtype=dtype)
 except ImportError:
     try:
-        from torch.amp import autocast, GradScaler  # 兼容 torch>=2.0
+        from torch.amp import autocast as _autocast, GradScaler  # torch>=2.0
+        def get_autocast(dtype):
+            return _autocast(device_type="cuda", dtype=dtype)
     except ImportError:
-        autocast, GradScaler = None, None
+        GradScaler = None
+        def get_autocast(dtype):
+            from contextlib import contextmanager
+            @contextmanager
+            def dummy():
+                yield
+            return dummy()
+
 
 class KGATrainer:
     def __init__(self, A_star: GenerativeQwenVLModel,
@@ -200,9 +212,7 @@ class KGATrainer:
                 self.A_star.train()
 
                 # 前向与损失构造（AMP）
-                if self._amp_enabled and (autocast is not None):
-                    acm = autocast(device_type='cuda', dtype=self._amp_dtype)
-                with acm:
+                with get_autocast(self._amp_dtype):
                     if self.objective == "eul":
                         # EUL：在 Df 上增大损失，同时在 Dr 上与 AD 保持一致
                         out_f = self.A_star.forward(images, texts, targets)
