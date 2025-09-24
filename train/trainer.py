@@ -249,7 +249,7 @@ class KGATrainer:
                         loss = L_forget + self.alpha * L_retain
 
                     else:
-                        logging.info(f"[KGA] 训练批次 {step}/{steps_total}，当前gap: {gap_star.item():.6f}")
+                        logging.info(f"[KGA] 让 A* 与 Af 在 Df 的gap 接近 AD 与 An 在 Dn 的gap")
                         # KGA：让 A* 与 Af 在 Df 的gap 接近 AD 与 An 在 Dn 的gap
                         out_f = self.A_star.forward(images, texts, targets)
                         nll_astar = out_f.loss  # 需要梯度
