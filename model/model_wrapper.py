@@ -369,7 +369,7 @@ class GenerativeQwenVLModel(nn.Module):
             )
             inputs = self.processor(
                 text=prompt_texts, images=images_per_sample,
-                return_tensors="pt", padding=True, truncation=True, max_length=self.max_seq_len
+                return_tensors="pt", padding=True
             )
             for k, v in inputs.items():
                 if isinstance(v, torch.Tensor):
@@ -407,8 +407,6 @@ class GenerativeQwenVLModel(nn.Module):
                 images=images_per_sample,
                 return_tensors="pt",
                 padding=True,
-                truncation=True,
-                max_length=self.max_seq_len,
             )
             # 3) 将 prompt 部分 labels 置 -100
             labels = inputs.get("labels", None)
@@ -460,8 +458,25 @@ class GenerativeQwenVLModel(nn.Module):
         if texts is None:
             raise ValueError("texts 不能为空")
         inputs = self._prepare_inputs(images, texts, targets)
-        out = self.model(**inputs)
-        logits = out.logits
+        out = self.model(**inputs, output_hidden_states=True, use_cache=False)
+        # 获取最后层隐藏状态并应用遗忘层（如启用）
+        last_hidden = out.hidden_states[-1]
+        logits = None
+        if self.unl_enabled and (self.unlearning_layer is not None):
+            last_hidden = self._apply_unl(last_hidden)
+            head = None
+            try:
+                head = self.model.get_output_embeddings()
+            except Exception:
+                head = getattr(self.model, "lm_head", None)
+                if head is None:
+                    head = getattr(getattr(self.model, "language_model", None), "lm_head", None)
+            if head is not None:
+                logits = head(last_hidden)
+            else:
+                logits = out.logits
+        else:
+            logits = out.logits
         labels = inputs.get("labels")
         loss = None
         if labels is not None:
@@ -472,9 +487,21 @@ class GenerativeQwenVLModel(nn.Module):
 
     def loss_on_batch(self, images, texts: Union[str, List[str]], targets: Union[str, List[str]]):
         inputs = self._prepare_inputs(images, texts, targets)
-        out = self.model(**inputs)
-        logits = out.logits  # [B, T, V]
-        labels = inputs["labels"]  # [B, T]
+        out = self.model(**inputs, output_hidden_states=True, use_cache=False)
+        last_hidden = out.hidden_states[-1]
+        if self.unl_enabled and (self.unlearning_layer is not None):
+            last_hidden = self._apply_unl(last_hidden)
+            head = None
+            try:
+                head = self.model.get_output_embeddings()
+            except Exception:
+                head = getattr(self.model, "lm_head", None)
+                if head is None:
+                    head = getattr(getattr(self.model, "language_model", None), "lm_head", None)
+            logits = head(last_hidden) if head is not None else out.logits
+        else:
+            logits = out.logits  // [B, T, V]
+        labels = inputs["labels"]  // [B, T]
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction="mean")

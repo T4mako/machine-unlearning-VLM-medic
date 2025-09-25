@@ -39,10 +39,10 @@ class TrainConfig:
     lr: float = 5e-4
     log_interval: int = 5 
     debug_limit: Optional[int] = 50  # 仅跑前 N 条样本做热身，确认流程
-    # === 新增：训练目标 & 冻结策略 ===
-    objective: str = "kga"            # 训练目标："kga" 或 "eul"
+    # === 训练目标 & 冻结策略 ===
+    objective: str = "fusion"         # 训练目标：融合（遗忘 + 保持 + 知识差距）
     freeze_backbone: bool = True      # 启用遗忘层时，是否冻结主干参数，仅训练遗忘层
-    # === 新增：低显存训练参数 ===
+    # === 低显存训练参数 ===
     gradient_accumulation_steps: int = 16  # 梯度累积步数
     use_8bit_optimizer: bool = False       # 是否使用 8-bit 优化器（bitsandbytes）
 
@@ -54,13 +54,16 @@ class EvalConfig:
 
 @dataclass
 class KGAConfig:
-    alpha: float = 1.0               # L = La + alpha * Lr（在EUL中作保持项权重）
+    alpha: float = 1.0               # 保持项权重：L = L_forget + alpha * L_retain + beta * L_gap
     sigma: float = 0.2               # 早停阈值比例：对齐误差 <= sigma * |基线差距|
     dn_ratio: float = 0.1            # 从全体样本中划出外部集 Dn 比例（简化近似）
     ad_checkpoint: Optional[str] = None  # 原始模型 AD 的 checkpoint（如无则用基础模型权重）
     af_checkpoint: Optional[str] = None  # 辅助模型 Af（在 Df 上训练）
     an_checkpoint: Optional[str] = None  # 辅助模型 An（在 Dn 上训练）
     use_nll_gap: bool = True         # 用 NLL 差近似 KL 差
+    # === 融合目标的权重 ===
+    lambda_f: float = 1.0            # 遗忘项权重
+    beta: float = 1.0                # 知识差距项权重
 
 
 # 新增：知识蒸馏配置（离线KD）
