@@ -447,9 +447,9 @@ def main():
             batch_size=config.train.batch_size,
             log_interval=config.train.log_interval,
             debug_limit=config.train.debug_limit,
-            load_AD=False,
-            load_Af=False,  # 关键：不加载 Af，依赖缓存
-            load_An=False,
+            load_AD=True,
+            load_Af=True,  # 关键：不加载 Af，依赖缓存
+            load_An=True,
             baseline_gap_override=baseline_gap_override,
             af_nll_path=os.path.join('logs', 'af_nll_forget.pt'),
         )
