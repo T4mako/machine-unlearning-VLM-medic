@@ -28,7 +28,7 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 # 保存当前数据集在磁盘上的根目录，用于解析相对路径图片
 _DATASET_LOCAL_ROOT = None
 
-def _resolve_repo_file_path(rel_path: str) -> str:
+def _resolve_repo_file_path(rel_path: str, only_local: bool = False) -> str:
     """尽量解析数据集相对路径到本地绝对路径。若失败返回空字符串。"""
     if not isinstance(rel_path, str) or not rel_path:
         return ""
@@ -70,14 +70,16 @@ def _ensure_pil(img_obj):
                 return None
         if "path" in img_obj:
             p = img_obj["path"]
-            rp = _resolve_repo_file_path(p)
+            # 只用本地路径解析，不再远程下载
+            rp = _resolve_repo_file_path(p, only_local=True)
             if rp:
                 try:
                     return PILImage.open(rp).convert("RGB")
                 except Exception:
                     return None
     if isinstance(img_obj, str):
-        rp = _resolve_repo_file_path(img_obj)
+        # 只用本地路径解析，不再远程下载
+        rp = _resolve_repo_file_path(img_obj, only_local=True)
         if rp:
             try:
                 return PILImage.open(rp).convert("RGB")
@@ -134,66 +136,58 @@ def _save_splits_to_cache(retain, forget, dn, val, dn_ratio: float, debug_limit:
 
 
 def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
-    """
-    加载 FreedomIntelligence/PubMedVision（子集：PubMedVision_Alignment_VQA），
-    """
     logging.info("prepare_datasets")
     if load_from_disk is None:
         raise ImportError("Please install 'datasets' to load FreedomIntelligence/PubMedVision from disk: pip install datasets")
 
-    # 参数
     dn_ratio = getattr(getattr(config, "kga", object()), "dn_ratio", 0.1)
     debug_limit = int(getattr(getattr(config, "train", object()), "debug_limit", 0) or 0)
-
     logging.info(f"开始准备数据 | dn_ratio={dn_ratio} debug_limit={debug_limit}")
 
-    # 优先从缓存加载
     cached = _load_splits_from_cache(dn_ratio, debug_limit)
     if cached is not None:
         logging.info("使用缓存数据")
         return cached
 
-    # 1) 加载数据集（优先本地，失败则从 Hub 下载并保存本地）
     ds = None
+    global _DATASET_LOCAL_ROOT
+    # 强制设置为 PubMedVision_repo 目录，确保图片路径正确
+    _DATASET_LOCAL_ROOT = os.path.abspath("./data/PubMedVision_repo")
+    logging.info(f"强制设置 _DATASET_LOCAL_ROOT: {_DATASET_LOCAL_ROOT}")
     try:
-        # 优先读取本地磁盘副本（满足你之前的需求）
         ds = load_from_disk("./data/PubMedVision_Alignment_VQA")
         logging.info("Loaded dataset from local disk: ./data/PubMedVision_Alignment_VQA")
     except Exception as e:
         logging.info(f"load_from_disk failed. Fallback to load_dataset from Hub...")
         ds = load_dataset("FreedomIntelligence/PubMedVision", "PubMedVision_Alignment_VQA")
-        # 同步保存一份到本地，方便下次直接从磁盘读取
         try:
             ds.save_to_disk('./data/PubMedVision_Alignment_VQA')
         except Exception as se:
             logging.info(f"save_to_disk failed: {se}")
+        # 只有本地加载失败时，才下载仓库快照
+        if snapshot_download is not None:
+            try:
+                _DATASET_LOCAL_ROOT = snapshot_download(
+                    repo_id="FreedomIntelligence/PubMedVision",
+                    repo_type="dataset",
+                    local_dir="./data/PubMedVision_repo",
+                    local_dir_use_symlinks=False,
+                )
+                logging.info(f"Repo snapshot prepared at: {_DATASET_LOCAL_ROOT}")
+            except Exception as re:
+                logging.info(f"snapshot_download failed: {re}")
+        if not _DATASET_LOCAL_ROOT:
+            for base in [
+                "./data/PubMedVision_repo",
+                "./data/PubMedVision_Alignment_VQA",
+                "./",
+            ]:
+                base_abs = os.path.abspath(base)
+                if os.path.exists(os.path.join(base_abs, "images")):
+                    _DATASET_LOCAL_ROOT = base_abs
+                    logging.info(f"Using heuristic dataset root: {_DATASET_LOCAL_ROOT}")
+                    break
 
-    # 为后续相对路径图片解析设置本地根目录优先级
-    global _DATASET_LOCAL_ROOT
-    # 1) 若可用，下载整个数据集仓库快照（包含 images/ 子目录）
-    if snapshot_download is not None:
-        try:
-            _DATASET_LOCAL_ROOT = snapshot_download(
-                repo_id="FreedomIntelligence/PubMedVision",
-                repo_type="dataset",
-                local_dir="./data/PubMedVision_repo",
-                local_dir_use_symlinks=False,
-            )
-            logging.info(f"Repo snapshot prepared at: {_DATASET_LOCAL_ROOT}")
-        except Exception as re:
-            logging.info(f"snapshot_download failed: {re}")
-    # 2) 若仍未确定根目录，尝试启发式本地路径
-    if not _DATASET_LOCAL_ROOT:
-        for base in [
-            "./data/PubMedVision_repo",
-            "./data/PubMedVision_Alignment_VQA",
-            "./",
-        ]:
-            base_abs = os.path.abspath(base)
-            if os.path.exists(os.path.join(base_abs, "images")):
-                _DATASET_LOCAL_ROOT = base_abs
-                logging.info(f"Using heuristic dataset root: {_DATASET_LOCAL_ROOT}")
-                break
 
     logging.info("加载数据...")
     split_name = "train" if "train" in ds else list(ds.keys())[0]
@@ -215,6 +209,7 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
             skipped_no_modality += 1
             continue
         images = ex.get("image")
+        logging.info("images: {}".format(images))
         # 兼容单图场景：字符串/字典则转为列表
         if isinstance(images, (str, dict)):
             images = [images]
@@ -308,7 +303,7 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     # 6) 根据 label==0 切分 retain/forget，并构建 Dn
     forget_label = 0
     # 模态标签非0的样本为保留集
-    retain_dataset = [it for it in train_pool if it["label"] != forget_label] 
+    retain_dataset = [it for it in train_pool if it["label"] != forget_label]
     # 模态标签为0的样本为遗忘集
     forget_dataset = [it for it in train_pool if it["label"] == forget_label]
     logging.info(f"Split by forget_label={forget_label}: retain={len(retain_dataset)}, forget={len(forget_dataset)}")
