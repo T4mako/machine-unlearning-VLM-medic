@@ -1,12 +1,19 @@
 import logging
 import math
 import time
+import os
 import torch
 import torch.nn.functional as F
 from typing import List, Dict, Optional
 from config import config
 from model.model_wrapper import GenerativeQwenVLModel
 from torchvision.transforms import ToTensor
+
+# 可选：PEFT 适配器加载
+try:
+    from peft import PeftModel  # type: ignore
+except Exception:
+    PeftModel = None  # type: ignore
 
 
 # 可选：bitsandbytes 8-bit 优化器
@@ -141,16 +148,34 @@ class KGATrainer:
             print("[Fusion][WARN] AD/An not both loaded, baseline_gap set to 0. Consider providing baseline_gap_override or enable load_AD/load_An.")
 
     def _load_model(self, ckpt_path):
+        # 选择基座模型名称：若是KD产物（LoRA适配器），则使用学生基座；否则使用全局大模型
+        base_name = config.model.model_name
+        try:
+            if ckpt_path and os.path.abspath(str(ckpt_path)) in [
+                os.path.abspath(config.kd.an_out_ckpt),
+                os.path.abspath(config.kd.af_out_ckpt),
+            ]:
+                base_name = getattr(config.kd, 'student_model_name', None) or base_name
+        except Exception:
+            pass
         # 若提供checkpoint可在此load; 否则构造同权重模型
-        model = GenerativeQwenVLModel(model_name=config.model.model_name, use_fast=config.model.use_fast)
+        model = GenerativeQwenVLModel(model_name=base_name, use_fast=config.model.use_fast, lora_enabled=False)
         # 禁用教师/基线模型的遗忘层，确保其行为稳定
         try:
             model.enable_unlearning(False)
         except Exception:
             pass
         if ckpt_path:
-            state = torch.load(ckpt_path, map_location=model.device)
-            model.load_state_dict(state)
+            try:
+                if os.path.isdir(str(ckpt_path)) and (PeftModel is not None):
+                    # 作为LoRA适配器目录加载
+                    model.model = PeftModel.from_pretrained(model.model, str(ckpt_path))
+                    logging.info(f"[Trainer] 已从LoRA目录加载适配器: {ckpt_path}")
+                else:
+                    state = torch.load(ckpt_path, map_location=model.device)
+                    model.load_state_dict(state)
+            except Exception as e:
+                logging.warning(f"[Trainer] 加载checkpoint失败 {ckpt_path}: {e}")
         return model
 
     def _iter_batches(self, data: List[Dict]):

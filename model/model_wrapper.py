@@ -1,4 +1,5 @@
 import logging
+from math import log
 
 import torch
 import torch.nn as nn
@@ -186,6 +187,7 @@ class GenerativeQwenVLModel(nn.Module):
 
         # LoRA 仅在启用时注入，并且只训练 LoRA 权重（其余冻结）
         if self.lora_enabled and (LoraConfig is not None) and (get_peft_model is not None):
+            logging.info(f"模型{model_name}初始化LoRA...")
             lora_cfg = LoraConfig(
                 r=int(self.lora_r),
                 lora_alpha=int(self.lora_alpha),
@@ -202,7 +204,8 @@ class GenerativeQwenVLModel(nn.Module):
                 if "lora" in name:
                     p.requires_grad = True
             logging.info("已注入 LoRA 适配器并冻结主干参数")
-
+        else:
+            logging.info(f"模型{model_name}未启用LoRA")
     def enable_unlearning(self, enabled: bool = True):
         self.unl_enabled = bool(enabled)
 
@@ -349,7 +352,7 @@ class GenerativeQwenVLModel(nn.Module):
         # 图像规范化为“每条样本的图像列表”的批格式
         images_per_sample = self._ensure_pil_per_sample(images)  # List[List[PIL]]
         B = len(images_per_sample)
-        logging.info(f"[KD] B样本数 {B}")
+        # logging.info(f"[KD] B样本数 {B}")
 
         # 文本广播/对齐
         if len(texts) == 1 and B > 1:
@@ -500,8 +503,8 @@ class GenerativeQwenVLModel(nn.Module):
                     head = getattr(getattr(self.model, "language_model", None), "lm_head", None)
             logits = head(last_hidden) if head is not None else out.logits
         else:
-            logits = out.logits  // [B, T, V]
-        labels = inputs["labels"]  // [B, T]
+            logits = out.logits
+        labels = inputs["labels"]
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction="mean")
@@ -523,3 +526,45 @@ class GenerativeQwenVLModel(nn.Module):
             last_hidden = outputs.hidden_states[-1]
             pooled = last_hidden.mean(dim=1)  # [B, H]
         return pooled
+
+
+import os
+import logging
+import torch
+from peft import PeftModel
+
+def auto_load_lora_or_pt(model, ckpt_path, device=None):
+    """
+    自动修正权重路径，优先加载LoRA适配器目录，回退.pt文件。
+    model: 主干模型
+    ckpt_path: 目录或.pt文件路径
+    device: 加载到的设备
+    返回加载后的模型
+    """
+    ckpt_path = str(ckpt_path)
+    if ckpt_path.endswith('.pt'):
+        lora_dir = ckpt_path[:-3]
+        if os.path.isdir(lora_dir):
+            logging.info(f"[权重加载] 检测到同名LoRA目录，优先加载: {lora_dir}")
+            ckpt_path = lora_dir
+    if os.path.isdir(ckpt_path):
+        logging.info(f"[权重加载] 发现LoRA适配器目录: {ckpt_path}")
+        expected_files = ['adapter_config.json', 'adapter_model.safetensors']
+        for f in expected_files:
+            if not os.path.exists(os.path.join(ckpt_path, f)):
+                raise FileNotFoundError(f"缺少必需文件: {f}")
+        model = PeftModel.from_pretrained(
+            model,
+            ckpt_path,
+            device_map={"": device} if device else None
+        )
+        logging.info(f"[权重加载] 已加载LoRA适配器: {ckpt_path}")
+        return model
+    elif os.path.isfile(ckpt_path):
+        logging.info(f"[权重加载] 尝试加载全量权重文件: {ckpt_path}")
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state)
+        logging.info(f"[权重加载] 已加载全量权重文件: {ckpt_path}")
+        return model
+    else:
+        raise FileNotFoundError(f"未找到权重文件或目录: {ckpt_path}")

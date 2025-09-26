@@ -108,6 +108,7 @@ def _progress_path(dn_ratio: float, debug_limit: int) -> str:
 
 def _load_splits_from_cache(dn_ratio: float, debug_limit: int):
     path = _cache_path(dn_ratio, debug_limit)
+    logging.info(f"尝试从缓存加载数据: {path}")
     if not os.path.exists(path):
         return None
     try:
@@ -195,6 +196,7 @@ def _process_sample(ex: Dict) -> Optional[Dict]:
 
 def _load_intermediate_samples(dn_ratio: float, debug_limit: int) -> List[Dict]:
     intermediate_file = _intermediate_path(dn_ratio, debug_limit)
+    logging.info(f"加载中间样本: {intermediate_file}")
     samples = []
     if not os.path.exists(intermediate_file):
         return samples
@@ -327,17 +329,14 @@ def prepare_datasets() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     random.seed(42)
     random.shuffle(items)
     n_total = len(items)
+    n_forget = max(1, int(0.1 * n_total))
+    n_dn = max(1, int(0.1 * n_total))
     n_val = max(1, int(0.1 * n_total))
-    val_data_meta = items[:n_val]
-    train_pool_meta = items[n_val:]
 
-    forget_label = 0
-    retain_meta = [it for it in train_pool_meta if it["label"] != forget_label]
-    forget_meta = [it for it in train_pool_meta if it["label"] == forget_label]
-
-    n_dn = max(1, int(dn_ratio * len(retain_meta))) if retain_meta else 0
-    random.seed(42)
-    dn_meta = random.sample(retain_meta, n_dn) if n_dn > 0 else []
+    forget_meta = items[:n_forget]
+    dn_meta = items[n_forget:n_forget + n_dn]
+    val_data_meta = items[n_forget + n_dn:n_forget + n_dn + n_val]
+    retain_meta = items[n_forget + n_dn + n_val:]
 
     # 8. 最后一步：将元数据转为含 PIL 的最终数据（这里会吃内存！）
     def _meta_to_pil_dataset(meta_list: List[Dict]) -> List[Dict]:

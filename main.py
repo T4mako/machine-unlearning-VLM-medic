@@ -10,7 +10,7 @@ from utils.log_config import setup_logging
 import argparse
 import os
 import math
-
+from tqdm import tqdm
 
 def _iter_batches(data, batch_size, debug_limit=None):
     dataset = data if debug_limit is None else data[: debug_limit]
@@ -34,9 +34,23 @@ def compute_baseline_gap_singleton(model_name: str, ckpt_ad: str, ckpt_an: str, 
         pass
 
     def _load_ckpt(ckpt):
+        logging.info(f"==========[GAP] 尝试加载checkpoint: {ckpt}")
         if ckpt:
-            state = torch.load(ckpt, map_location=model.device)
-            model.load_state_dict(state)
+            try:
+                if os.path.isdir(str(ckpt)):
+                    try:
+                        from peft import PeftModel
+                        model.model = PeftModel.from_pretrained(model.model, str(ckpt))
+                        logging.info(f"[GAP] 已加载LoRA适配器: {ckpt}")
+                    except Exception as e:
+                        logging.warning(f"[GAP] LoRA适配器加载失败，回退到全量权重: {e}")
+                        state = torch.load(ckpt, map_location=model.device)
+                        model.load_state_dict(state)
+                else:
+                    state = torch.load(ckpt, map_location=model.device)
+                    model.load_state_dict(state)
+            except Exception as e:
+                logging.warning(f"[GAP] 加载checkpoint失败，将使用预训练权重: {e}")
 
     # 先跑 AD（完整数据 D 上训练的原始模型）
     _load_ckpt(ckpt_ad)
@@ -76,9 +90,20 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
         pass
     if ckpt_ad:
         try:
-            state = torch.load(ckpt_ad, map_location=AD.device)
-            AD.load_state_dict(state)
-            logging.info(f"[GAP] 已加载 AD checkpoint: {ckpt_ad}")
+            if os.path.isdir(str(ckpt_ad)):
+                logging.info(f"==========[GAP] 尝试加载checkpoint: {ckpt}")
+                try:
+                    from peft import PeftModel
+                    AD.model = PeftModel.from_pretrained(AD.model, str(ckpt_ad))
+                    logging.info(f"[GAP] 已加载 AD LoRA 适配器: {ckpt_ad}")
+                except Exception as e2:
+                    logging.warning(f"[GAP] AD LoRA 加载失败，回退到全量权重: {e2}")
+                    state = torch.load(ckpt_ad, map_location=AD.device)
+                    AD.load_state_dict(state)
+            else:
+                state = torch.load(ckpt_ad, map_location=AD.device)
+                AD.load_state_dict(state)
+            logging.info(f"[GAP] 已加载 AD checkpoint/适配器: {ckpt_ad}")
         except Exception as e:
             logging.warning(f"[GAP] 加载 AD checkpoint 失败，将使用预训练权重: {e}")
     nll_ad = []
@@ -92,18 +117,55 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
         pass
 
     # 再评估 An 在 Dn 上的 NLL
-    An = GenerativeQwenVLModel(model_name=an_model_name, use_fast=config.model.use_fast)
+    An = GenerativeQwenVLModel(model_name=an_model_name, use_fast=config.model.use_fast,lora_enabled=False)
     try:
         An.enable_unlearning(False)
     except Exception:
         pass
-    if ckpt_an:
+
+    logging.info(f"[GAP] 尝试加载An checkpoint: {ckpt_an}")
+    # 自动修正权重路径：如果是.pt文件，优先尝试同名目录
+    ckpt_an_path = str(ckpt_an)
+    if ckpt_an_path.endswith('.pt'):
+        lora_dir = ckpt_an_path[:-3]
+        if os.path.isdir(lora_dir):
+            logging.info(f"[GAP] 检测到同名LoRA目录，优先加载: {lora_dir}")
+            ckpt_an_path = lora_dir
+    if ckpt_an_path:
         try:
-            state = torch.load(ckpt_an, map_location=An.device)
-            An.load_state_dict(state)
-            logging.info(f"[GAP] 已加载 An checkpoint: {ckpt_an}")
+            if os.path.isdir(ckpt_an_path):
+                logging.info(f"[GAP] 发现 An checkpoint 目录: {ckpt_an_path}")
+                try:
+                    from peft import PeftModel
+                    expected_files = ['adapter_config.json', 'adapter_model.safetensors']
+                    for f in expected_files:
+                        if not os.path.exists(os.path.join(ckpt_an_path, f)):
+                            raise FileNotFoundError(f"缺少必需文件: {f}")
+                    logging.info(f"[GAP] 开始加载 An LoRA 适配器...")
+                    An.model = PeftModel.from_pretrained(
+                        An.model,
+                        ckpt_an_path,
+                        device_map={"": An.device} if hasattr(An, 'device') else None
+                    )
+                    logging.info(f"[GAP] 已加载 An LoRA 适配器: {ckpt_an_path}")
+                except Exception as e2:
+                    logging.error(f"[GAP] An LoRA 加载失败（{type(e2).__name__}）: {e2}")
+                    logging.warning("[GAP] 尝试回退到全量权重加载...")
+                    pt_file = ckpt_an_path + '.pt'
+                    if os.path.isfile(pt_file):
+                        state = torch.load(pt_file, map_location=An.device)
+                        An.load_state_dict(state)
+                        logging.info(f"[GAP] 已加载全量权重文件: {pt_file}")
+                    else:
+                        raise FileNotFoundError(f"未找到全量权重文件: {pt_file}")
+            else:
+                logging.info(f"[GAP] 尝试加载全量权重文件: {ckpt_an_path}")
+                state = torch.load(ckpt_an_path, map_location=An.device)
+                An.load_state_dict(state)
+            logging.info(f"[GAP] 已加载 An checkpoint/适配器: {ckpt_an_path}")
         except Exception as e:
-            logging.warning(f"[GAP] 加载 An checkpoint 失败，将使用预训练权重: {e}")
+            logging.error(f"[GAP] 加载 An checkpoint 失败（{type(e).__name__}）: {e}")
+            logging.warning("[GAP] 将使用预训练权重")
     nll_an = []
     for images, texts, targets in _iter_batches(dn_data, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
         nll = An.compute_nll(images, texts, targets)
@@ -122,7 +184,7 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
 
 def precompute_af_nll_singleton(model_name: str, ckpt_af: str, forget_data, out_path: str):
     """仅加载一次模型实例，加载Af权重（在 Df 上训练的辅助模型），按batch计算在 Df 上的NLL均值并缓存到磁盘（逐样本nll同时保存便于校验）。"""
-    model = GenerativeQwenVLModel(model_name=model_name, use_fast=config.model.use_fast)
+    model = GenerativeQwenVLModel(model_name=model_name, use_fast=config.model.use_fast,lora_enabled=False)
     try:
         model.enable_unlearning(False)
     except Exception:
@@ -163,7 +225,7 @@ def precompute_af_nll_singleton(model_name: str, ckpt_af: str, forget_data, out_
 def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_ckpt: str, max_len: int, temperature: float):
     """仅加载一次教师模型，为给定数据集生成伪标签并保存到磁盘。"""
     logging.info(f"[KD] {teacher_model_name} 模型准备伪标签 -> {out_path}")
-    teacher = GenerativeQwenVLModel(model_name=teacher_model_name, use_fast=config.model.use_fast)
+    teacher = GenerativeQwenVLModel(model_name=teacher_model_name, use_fast=config.model.use_fast, load_in_4bit=False,lora_enabled=False)
     try:
         teacher.enable_unlearning(False)
     except Exception:
@@ -178,17 +240,27 @@ def prepare_kd_labels(dataset, out_path: str, teacher_model_name: str, teacher_c
 
     all_prompts = []
     all_labels = []
-    for images, texts, _ in _iter_batches(dataset, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
+    batch_size = config.train.batch_size
+    debug_limit = getattr(config.train, 'debug_limit', None)
+    total_samples = len(dataset) if debug_limit is None else min(len(dataset), debug_limit)
+    num_batches = (total_samples + batch_size - 1)
+    for images, texts, _ in tqdm(
+            _iter_batches(dataset, batch_size, debug_limit),
+            total=num_batches,
+            desc="[KD] 生成伪标签",
+            dynamic_ncols=True
+    ):
         assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
         gens = teacher.generate(images, texts, temperature=temperature)
         all_prompts.extend(texts)
         all_labels.extend(gens)
+
     # 保存
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     torch.save({
         "prompts": all_prompts,
         "labels": all_labels,
-        "meta": {"count": len(all_prompts), "batch_size": int(config.train.batch_size)}
+        "meta": {"count": len(all_prompts), "batch_size": int(batch_size)}
     }, out_path)
     logging.info(f"[KD] 伪标签已保存: {out_path} | {len(all_labels)} 条")
 
@@ -215,7 +287,7 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     assert len(kd_prompts) == len(kd_labels), "KD标签文件损坏：prompts/labels长度不一致"
 
     model_name_to_use = student_model_name
-    student = GenerativeQwenVLModel(model_name=student_model_name, use_fast=config.model.use_fast,load_in_4bit=True,lora_enabled=True)
+    student = GenerativeQwenVLModel(model_name=student_model_name, use_fast=config.model.use_fast,load_in_4bit=False,lora_enabled=True)
     logging.info(f"[KD] 学生模型已加载完毕: {model_name_to_use}")
     try:
         student.enable_unlearning(False)  # An/Af 不使用遗忘层
@@ -231,8 +303,12 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
         except Exception as e:
             logging.warning(f"[KD] 学生初始化checkpoint加载失败，使用预训练初始化: {e}")
 
-    # 优化器
-    optim = torch.optim.AdamW(student.parameters(), lr=config.train.lr)
+    # 优化器：仅训练LoRA权重
+    lora_params = [p for n, p in student.model.named_parameters() if p.requires_grad]
+    if len(lora_params) == 0:
+        logging.warning("[KD] 未发现可训练参数，回退到训练全部参数（可能未成功注入LoRA）")
+        lora_params = list(student.parameters())
+    optim = torch.optim.AdamW(lora_params, lr=config.train.lr)
 
     B = max(int(config.train.batch_size), 1)
     n_items = len(dataset)
@@ -243,6 +319,11 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
     def _get_kd_target_slice(start, end):
         return kd_labels[start:end]
 
+    metrics = []
+    best_loss = float('inf')
+    patience = getattr(config.train, 'early_stopping_patience', 10)
+    no_improve_epochs = 0
+    stop_epoch = None
     idx = 0
     for epoch in range(int(config.train.epochs)):
         total_loss = 0.0
@@ -254,7 +335,6 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
             texts = [x["text"] for x in batch]
             targets = _get_kd_target_slice(i, min(i + B, n_items))
             assert images is not None and len(images) == len(texts), "[KD] images为空或数量不匹配，必须为多模态输入"
-            logging.info(f"[KD] 数据批次 {n_batches} | 样本数 {len(images)} | 目标数 {len(targets)}")
             loss = student.loss_on_batch(images, texts, targets)
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -265,12 +345,65 @@ def train_student_from_kd_labels(dataset, labels_path: str, out_ckpt: str, stude
             if (n_batches % max(int(config.train.log_interval), 1)) == 0:
                 logging.info(f"[KD][epoch {epoch}] step={n_batches} loss={total_loss / max(n_batches,1):.4f}")
 
-        logging.info(f"[KD] epoch={epoch} avg_loss={total_loss / max(n_batches,1):.4f}")
+        avg_loss = total_loss / max(n_batches,1)
+        logging.info(f"[KD] epoch={epoch} avg_loss={avg_loss:.4f}")
+        metrics.append({
+            "epoch": epoch,
+            "avg_loss": avg_loss,
+            "steps": n_batches,
+            "total_loss": total_loss
+        })
+        # 早停机制
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+            logging.info(f"[KD] 早停计数: {no_improve_epochs}/{patience}")
+            if no_improve_epochs >= patience:
+                logging.info(f"[KD] 触发早停机制，提前终止训练于 epoch {epoch}")
+                stop_epoch = epoch
+                break
 
-    # 保存学生
+    # 保存训练指标到 logs/LoRA/
+    import json, datetime
+    log_dir = os.path.join("logs", "LoRA")
+    os.makedirs(log_dir, exist_ok=True)
+    # 生成文件名：时间+模型名+数据名+数据量
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset_name = getattr(dataset, "name", "data")
+    # 修复模型名中的非法字符
+    safe_model_name = str(student_model_name).replace('/', '_').replace('\\', '_').replace(':', '_')
+    log_file = f"{now_str}_{safe_model_name}_{dataset_name}_{n_items}.json"
+    log_path = os.path.join(log_dir, log_file)
+    log_data = {
+        "metrics": metrics,
+        "early_stopped": stop_epoch is not None,
+        "stop_epoch": stop_epoch
+    }
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(log_data, f, ensure_ascii=False, indent=2)
+    logging.info(f"[KD] LoRA训练日志已保存: {log_path}")
+
+    # 保存学生LoRA 适配器（目录或文件名）
     os.makedirs(os.path.dirname(out_ckpt), exist_ok=True)
-    torch.save(student.state_dict(), out_ckpt)
-    logging.info(f"[KD] 学生已保存: {out_ckpt}")
+    try:
+        from peft import PeftModel
+        if isinstance(student.model, PeftModel):
+            # 若 out_ckpt 是 .pt 文件名，则改为目录（去除扩展名）
+            save_dir = out_ckpt
+            if os.path.splitext(save_dir)[1].lower() in ('.pt', '.bin'):
+                save_dir = os.path.splitext(save_dir)[0]
+            student.model.save_pretrained(save_dir)
+            logging.info(f"[KD] LoRA 适配器已保存: {save_dir}")
+        else:
+            # 回退：保存全量权重（不推荐，但保持兼容）
+            torch.save(student.state_dict(), out_ckpt)
+            logging.info(f"[KD] 学生已保存(全量权重): {out_ckpt}")
+    except Exception as e:
+        # 无 peft 或保存失败则回退
+        torch.save(student.state_dict(), out_ckpt)
+        logging.warning(f"[KD] 保存LoRA失败，已保存全量权重: {out_ckpt} | err={e}")
 
     # 释放
     del student
@@ -320,6 +453,15 @@ def main():
             temperature=float(config.kd.gen_temperature)
         )
         logging.info(f"[KD] {role.upper()} 伪标签已生成 -> {labels_path}")
+        student_name = config.kd.student_model_name
+        train_student_from_kd_labels(
+            dataset=dataset,
+            labels_path=labels_path,
+            out_ckpt=out_ckpt,
+            student_model_name=student_name,
+            student_init_ckpt=(config.kd.student_init_ckpt or None)
+        )
+        logging.info(f"[KD] {role.upper()} 蒸馏流程完成 -> {out_ckpt}")
         return
 
     # 拆分后的KD模式：只训练学生
@@ -357,6 +499,7 @@ def main():
             temperature=float(config.kd.gen_temperature)
         )
         logging.info(f"[KD] {role.upper()} 伪标签已生成 -> {labels_path}")
+        student_name = config.kd.student_model_name
         train_student_from_kd_labels(
             dataset=dataset,
             labels_path=labels_path,
@@ -372,14 +515,23 @@ def main():
         # 单实例顺序加载 AD/An，避免并发占用显存
         # 若未显式提供 An checkpoint，优先使用KD产物
         ckpt_an = config.kga.an_checkpoint
-        if (ckpt_an is None or not os.path.exists(str(ckpt_an))) and os.path.exists(config.kd.an_out_ckpt):
-            ckpt_an = config.kd.an_out_ckpt
-            logging.info(f"[KGA] 使用KD产出的An: {ckpt_an}")
-        # 根据 An 来源选择对应的模型名称（KD 产物通常为文本-only 学生）
+        if ckpt_an is None or not os.path.exists(str(ckpt_an)):
+            candidate_file = config.kd.an_out_ckpt
+            candidate_dir = os.path.splitext(candidate_file)[0]
+            logging.info(f"[KGA] 未提供有效的An checkpoint，尝试使用KD产物{candidate_file}")
+            if os.path.exists(candidate_file):
+                logging.info(f"[KGA] 发现KD产物文件: {candidate_file}")
+                ckpt_an = candidate_file
+            elif os.path.exists(candidate_dir):
+                ckpt_an = candidate_dir
+                logging.info(f"[KGA] 发现KD产物目录: {ckpt_an}")
+            if ckpt_an is not None:
+                logging.info(f"[KGA] 使用KD产出的An: {ckpt_an}")
+        # 根据 An 来源选择对应的模型名称（KD 产物通常为学生 LoRA 适配器）
         an_model_name = config.model.model_name
         try:
-            if ckpt_an and os.path.abspath(ckpt_an) == os.path.abspath(config.kd.an_out_ckpt):
-                an_model_name = config.kd.student_model_name or ('ibm-granite/granite-docling-258M')
+            if ckpt_an and (os.path.isdir(str(ckpt_an)) or os.path.abspath(ckpt_an) == os.path.abspath(config.kd.an_out_ckpt)):
+                an_model_name = config.kd.student_model_name
         except Exception:
             pass
         gap = compute_baseline_gap_dual(
@@ -398,9 +550,18 @@ def main():
     if args.mode == 'precompute_af_nll':
         # 若未显式提供 Af checkpoint，优先使用KD产物
         ckpt_af = config.kga.af_checkpoint
-        if (ckpt_af is None or not os.path.exists(str(ckpt_af))) and os.path.exists(config.kd.af_out_ckpt):
-            ckpt_af = config.kd.af_out_ckpt
-            logging.info(f"[KGA] 使用KD产出的Af: {ckpt_af}")
+        if ckpt_af is None or not os.path.exists(str(ckpt_af)):
+            candidate_file = config.kd.af_out_ckpt
+            candidate_dir = os.path.splitext(candidate_file)[0]
+            logging.info(f"[KGA] 未提供有效的Af checkpoint，尝试使用KD产物{candidate_file}")
+            if os.path.exists(candidate_file):
+                logging.info(f"[KGA] 发现KD产物文件: {candidate_file}")
+                ckpt_af = candidate_file
+            elif os.path.exists(candidate_dir):
+                ckpt_af = candidate_dir
+                logging.info(f"[KGA] 发现KD产物目录: {ckpt_af}")
+            if ckpt_af is not None:
+                logging.info(f"[KGA] 使用KD产出的Af: {ckpt_af}")
         # 选择 Af 对应的模型名称
         af_model_name = config.model.model_name
         try:
@@ -409,7 +570,11 @@ def main():
         except Exception:
             pass
         out_path = os.path.join('logs', 'af_nll_forget.pt')
-        precompute_af_nll_singleton(af_model_name, ckpt_af, forget_data, out_path)
+        precompute_af_nll_singleton(
+            model_name=config.model.model_name,
+            ckpt_af=config.kga.ad_checkpoint,
+            forget_data=forget_data,
+            out_path=out_path)
         return
 
     if args.mode == 'train_with_af':
@@ -436,7 +601,7 @@ def main():
                 logging.warning(f"[WARN] Failed to load AD checkpoint for A*: {e}")
 
         # 打印 A* 的遗忘层 
-        logging.info(f"[DEBUG][A*] 遗忘层参数: {[p.data for p in A_star.unlearning_layer.parameters()]}")
+        # logging.info(f"[DEBUG][A*] 遗忘层参数: {[p.data for p in A_star.unlearning_layer.parameters()]}")
         trainer = KGATrainer(
             A_star=A_star,
             retain_data=retain_data,

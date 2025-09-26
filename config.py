@@ -26,7 +26,7 @@ class ModelConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"
+        "q_proj", "v_proj", "o_proj"", k_proj", "gate_proj", "up_proj", "down_proj"
     ])
     # 图像与文本上限（用于进一步降低显存）
     max_image_res: int = 256           # 训练阶段统一缩放至不超过该分辨率的正方形
@@ -34,17 +34,19 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 1
-    epochs: int = 100
+    batch_size: int = 4
+    epochs: int = 200
     lr: float = 5e-4
     log_interval: int = 5 
-    debug_limit: Optional[int] = None  # 仅跑前 N 条样本做热身，确认流程
+    debug_limit: Optional[int] = 1000  # 仅跑前 N 条样本做热身，确认流程
     # === 训练目标 & 冻结策略 ===
     objective: str = "fusion"         # 训练目标：融合（遗忘 + 保持 + 知识差距）
     freeze_backbone: bool = True      # 启用遗忘层时，是否冻结主干参数，仅训练遗忘层
     # === 低显存训练参数 ===
     gradient_accumulation_steps: int = 16  # 梯度累积步数
     use_8bit_optimizer: bool = False       # 是否使用 8-bit 优化器（bitsandbytes）
+    early_stopping_patience: int = 20      # 早停轮数
+
 
 
 @dataclass
