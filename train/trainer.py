@@ -51,7 +51,7 @@ class KGATrainer:
             # 确保遗忘层参数可训练
             for p in self.A_star.get_unlearning_parameters():
                 p.requires_grad = True
-            # opt_params = list(self.A_star.get_unlearning_parameters())
+            opt_params = list(self.A_star.get_unlearning_parameters())
             # logging.info("[DEBUG] 冻结后遗忘层参数 requires_grad 状态:")
             # for i, p in enumerate(opt_params):
             #     logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
