@@ -601,7 +601,6 @@ def main():
                 logging.warning(f"[WARN] Failed to load AD checkpoint for A*: {e}")
 
         # 打印 A* 的遗忘层 
-        # logging.info(f"[DEBUG][A*] 遗忘层参数: {[p.data for p in A_star.unlearning_layer.parameters()]}")
         trainer = KGATrainer(
             A_star=A_star,
             retain_data=retain_data,

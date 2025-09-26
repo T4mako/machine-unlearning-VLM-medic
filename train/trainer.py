@@ -31,8 +31,13 @@ to_tensor = ToTensor()
 class KGATrainer:
     def __init__(self, A_star: GenerativeQwenVLModel,
                  retain_data: List[Dict], forget_data: List[Dict], dn_data: List[Dict], val_data: List[Dict],
-                 lr=5e-6, batch_size=2, log_interval=5, debug_limit=None,
-                 load_AD: bool = True, load_Af: bool = True, load_An: bool = True,
+                 lr=5e-6, 
+                 batch_size=2, 
+                 log_interval=5, 
+                 debug_limit=None,
+                 load_AD: bool = False, 
+                 load_Af: bool = True, 
+                 load_An: bool = False,
                  baseline_gap_override: Optional[float] = None,
                  af_nll_path: Optional[str] = None):
         self.A_star = A_star  # 待遗忘模型，初始化自 AD 权重
@@ -203,24 +208,34 @@ class KGATrainer:
         return total / max(count, 1)
 
     def train(self, epochs=3):
-        # 融合目标需要：AD（保持项）、Af 或其NLL缓存（gap_*）、An 或 baseline_gap_override（基线gap）
-        if self.AD is None:
-            raise RuntimeError("Fusion objective requires AD (teacher) to be loaded. Please set load_AD=True.")
-        if (self.Af is None) and (self.af_nll_batches is None):
-            raise RuntimeError("Fusion objective requires Af or Af-NLL cache. Please set load_Af=True or provide af_nll_path cache.")
-        if (self.An is None) and (self.baseline_gap == 0.0):
-            print("[Fusion][WARN] An not loaded and baseline_gap is 0. Provide baseline_gap_override or enable load_An to compute it.")
+        # 融合目标依赖项检查：按权重启用
+        gap_enabled = (self.beta > 0.0) and ((self.Af is not None) or (self.af_nll_batches is not None))
+        if self.alpha > 0.0 and self.AD is None:
+            print("[Fusion][WARN] alpha>0 但未加载AD，保持项将被跳过（L_retain=0）。如需启用请设置 load_AD=True 或提供 AD 权重。")
+        if (self.beta > 0.0) and not gap_enabled:
+            print("[Fusion][WARN] beta>0 但未加载Af且未提供Af-NLL缓存，知识差距项将被跳过（L_gap=0）。如需启用请设置 load_Af=True 或提供 af_nll_path。")
+        if not gap_enabled:
+            # 未启用gap项时无需An/baseline_gap
+            pass
+        else:
+            if (self.An is None) and (self.baseline_gap == 0.0):
+                print("[Fusion][WARN] 未加载An且未提供baseline_gap_override，baseline_gap将为0，早停阈值可能过低。建议提供baseline_gap_override或启用load_An计算。")
 
-        # 初始知识差距（可选）：在 Df 上度量 AD 与 Af 的差距，用于参考
+        # 初始知识差距（可选）：在 Df 上度量 AD 与 Af 的差距
         with torch.no_grad():
-            if (self.AD is not None) and (self.Af is not None):
+            if gap_enabled and (self.AD is not None) and (self.Af is not None):
                 init_gap = self._estimate_baseline_gap(self.AD, self.Af, self.forget_data)
                 print(f"[Fusion] Initial gap on Df between AD and Af: {init_gap:.6f}")
             else:
-                print("[Fusion] Skipping initial AD-Af gap computation (teacher/reference not fully loaded or using cache).")
+                print("[Fusion] Skipping initial AD-Af gap computation (disabled or missing models/cache).")
 
-        target_threshold = self.sigma * max(self.baseline_gap, 1e-8)
-        print(f"[Fusion] Early-stop threshold: {target_threshold:.6f}")
+        # 早停阈值（仅在gap项启用时有意义）
+        target_threshold = None
+        if gap_enabled:
+            target_threshold = self.sigma * max(self.baseline_gap, 1e-8)
+            print(f"[Fusion] Early-stop threshold: {target_threshold:.6f}")
+        else:
+            print("[Fusion] Early-stop disabled (gap term not enabled).")
 
         global_step = 0
         self.optimizer.zero_grad()
@@ -242,21 +257,23 @@ class KGATrainer:
                     nll_astar = out_f.loss  # 需要梯度
                     L_forget = - nll_astar
 
-                    # 2) 知识差距项（Df）：让 A* 与 Af 的 gap_* 接近基线 gap_base
-                    if self.Af is not None:
-                        with torch.no_grad():
-                            nll_af = self.Af.compute_nll(images, texts, targets)
+                    # 2) 知识差距项（Df）：仅在启用时计算
+                    if gap_enabled:
+                        if self.Af is not None:
+                            with torch.no_grad():
+                                nll_af = self.Af.compute_nll(images, texts, targets)
+                        else:
+                            if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
+                                raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
+                            nll_af = torch.tensor(self.af_nll_batches[step], device=self.A_star.device, dtype=nll_astar.dtype)
+                        gap_star = torch.abs(nll_astar - nll_af)
+                        gap_base = torch.tensor(self.baseline_gap, device=self.A_star.device, dtype=gap_star.dtype)
+                        L_gap = torch.abs(gap_star - gap_base)
                     else:
-                        if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
-                            raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
-                        nll_af = torch.tensor(self.af_nll_batches[step], device=self.A_star.device, dtype=nll_astar.dtype)
-                    gap_star = torch.abs(nll_astar - nll_af)
+                        L_gap = torch.tensor(0.0, device=self.A_star.device)
 
-                    gap_base = torch.tensor(self.baseline_gap, device=self.A_star.device, dtype=gap_star.dtype)
-                    L_gap = torch.abs(gap_star - gap_base)
-
-                    # 3) 保持项（Dr）：在 Dr 上让 A* 接近 AD
-                    if (len(self.retain_data) > 0) and (self.AD is not None):
+                    # 3) 保持项（Dr）：仅当启用且AD存在时计算
+                    if (self.alpha > 0.0) and (len(self.retain_data) > 0) and (self.AD is not None):
                         ridx = (global_step + step) % max(len(self.retain_data), 1)
                         r_end = min(ridx + self.batch_size, len(self.retain_data))
                         r_batch = self.retain_data[ridx:r_end]
@@ -303,26 +320,29 @@ class KGATrainer:
             epoch_loss = total_loss / max(total_steps, 1)
             print(f"[Fusion] Epoch {epoch+1} avg loss: {epoch_loss:.6f}")
 
-            # 监控当前在 Df 上的 gap_* 均值，用于早停
-            with torch.no_grad():
-                current_gap = 0.0
-                cnt = 0
-                for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
-                    nll_astar = float(self.A_star.compute_nll(images, texts, targets).item())
-                    if self.Af is not None:
-                        nll_af = float(self.Af.compute_nll(images, texts, targets).item())
-                    else:
-                        if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
-                            raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
-                        nll_af = float(self.af_nll_batches[step])
-                    current_gap += abs(nll_astar - nll_af)
-                    cnt += 1
-                current_gap /= max(cnt, 1)
-            print(f"[Fusion] Current gap_* on Df: {current_gap:.6f}")
+            # 监控当前在 Df 上的 gap_* 均值（仅在启用时）
+            if gap_enabled and (self.sigma > 0.0):
+                with torch.no_grad():
+                    current_gap = 0.0
+                    cnt = 0
+                    for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
+                        nll_astar = float(self.A_star.compute_nll(images, texts, targets).item())
+                        if self.Af is not None:
+                            nll_af = float(self.Af.compute_nll(images, texts, targets).item())
+                        else:
+                            if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
+                                raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
+                            nll_af = float(self.af_nll_batches[step])
+                        current_gap += abs(nll_astar - nll_af)
+                        cnt += 1
+                    current_gap /= max(cnt, 1)
+                print(f"[Fusion] Current gap_* on Df: {current_gap:.6f}")
 
-            if current_gap <= (self.sigma * max(self.baseline_gap, 1e-8)):
-                print(f"[Fusion] Early stop: gap_* ({current_gap:.6f}) <= threshold ({self.sigma * max(self.baseline_gap, 1e-8):.6f})")
-                break
+                if (target_threshold is not None) and (current_gap <= target_threshold):
+                    print(f"[Fusion] Early stop: gap_* ({current_gap:.6f}) <= threshold ({target_threshold:.6f})")
+                    break
+            else:
+                print("[Fusion] Skipping gap-based early stop (disabled).")
 
         print("[Fusion] Training finished.")
 
