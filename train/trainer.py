@@ -51,15 +51,16 @@ class KGATrainer:
             # 确保遗忘层参数可训练
             for p in self.A_star.get_unlearning_parameters():
                 p.requires_grad = True
-            opt_params = list(self.A_star.get_unlearning_parameters())
-            logging.info("[DEBUG] 冻结后遗忘层参数 requires_grad 状态:")
-            for i, p in enumerate(opt_params):
-                logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
+            # opt_params = list(self.A_star.get_unlearning_parameters())
+            # logging.info("[DEBUG] 冻结后遗忘层参数 requires_grad 状态:")
+            # for i, p in enumerate(opt_params):
+            #     logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
         else:
             opt_params = list(self.A_star.parameters())
             logging.info("[DEBUG] 训练全部参数，数量: %d", len(opt_params))
             for i, p in enumerate(opt_params):
                 logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
+
         # 训练精度与AMP
         self.precision = str(getattr(config.model, "precision", "bf16")).lower()
         self._amp_enabled = (torch.cuda.is_available() and (_autocast is not None) and (self.precision in ["bf16", "fp16"]))
@@ -153,6 +154,7 @@ class KGATrainer:
             print("[Fusion][WARN] AD/An not both loaded, baseline_gap set to 0. Consider providing baseline_gap_override or enable load_AD/load_An.")
 
     def _load_model(self, ckpt_path):
+        logging.info(f"[Trainer] Loading model from checkpoint: {ckpt_path}")
         # 选择基座模型名称：若是KD产物（LoRA适配器），则使用学生基座；否则使用全局大模型
         base_name = config.model.model_name
         try:

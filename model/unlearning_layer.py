@@ -22,10 +22,10 @@ class UnlearningLayer(nn.Module):
         residual_out = self.residual(x)
         out = mlp_out + residual_out
         # 打印遗忘层参数和输出
-        logging.info(f"[DEBUG][UnlearningLayer] mlp.weight: {[p.data for p in self.mlp.parameters()]}")
-        logging.info(f"[DEBUG][UnlearningLayer] residual.weight: {self.residual.weight.data}")
-        logging.info(f"[DEBUG][UnlearningLayer] input: {x}")
-        logging.info(f"[DEBUG][UnlearningLayer] mlp_out: {mlp_out}")
-        logging.info(f"[DEBUG][UnlearningLayer] residual_out: {residual_out}")
-        logging.info(f"[DEBUG][UnlearningLayer] output: {out}")
+        # logging.info(f"[DEBUG][UnlearningLayer] mlp.weight: {[p.data for p in self.mlp.parameters()]}")
+        # logging.info(f"[DEBUG][UnlearningLayer] residual.weight: {self.residual.weight.data}")
+        # logging.info(f"[DEBUG][UnlearningLayer] input: {x}")
+        # logging.info(f"[DEBUG][UnlearningLayer] mlp_out: {mlp_out}")
+        # logging.info(f"[DEBUG][UnlearningLayer] residual_out: {residual_out}")
+        # logging.info(f"[DEBUG][UnlearningLayer] output: {out}")
         return out

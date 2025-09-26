@@ -591,7 +591,7 @@ def main():
                     logging.warning(f"[KGA] 读取 baseline_gap 文件失败: {e}")
 
         A_star = GenerativeQwenVLModel(model_name=config.model.model_name, use_fast=config.model.use_fast, enable_unl=True, load_in_4bit= False,lora_enabled=False)
-        logging.info(f"模型初始化: {config.model.model_name} on device {A_star.device}")
+        logging.info(f"【A*】模型初始化: {config.model.model_name} on device {A_star.device}")
         if config.kga.ad_checkpoint:
             try:
                 state = torch.load(config.kga.ad_checkpoint, map_location=A_star.device)
@@ -600,7 +600,6 @@ def main():
             except Exception as e:
                 logging.warning(f"[WARN] Failed to load AD checkpoint for A*: {e}")
 
-        # 打印 A* 的遗忘层 
         trainer = KGATrainer(
             A_star=A_star,
             retain_data=retain_data,
