@@ -480,7 +480,7 @@ class GenerativeQwenVLModel(nn.Module):
                     logging.warning(f"未找到合适的输出嵌入层，使用模型的 lm_head: {head}")
             if head is not None:
                 logits = head(last_hidden)
-                logging.info(f"通过输出嵌入层得到 logits: {logits.shape}")
+                # logging.info(f"通过输出嵌入层得到 logits: {logits.shape}")
             else:
                 logits = out.logits
                 logging.info(f"未通过输出嵌入层，直接使用模型 logits: {logits.shape}")
