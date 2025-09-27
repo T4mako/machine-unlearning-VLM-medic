@@ -31,7 +31,7 @@ to_tensor = ToTensor()
 class KGATrainer:
     def __init__(self, A_star: GenerativeQwenVLModel,
                  retain_data: List[Dict], forget_data: List[Dict], dn_data: List[Dict], val_data: List[Dict],
-                 lr=config.train.lr, 
+                 lr=5e-2, 
                  batch_size=config.train.batch_size, 
                  log_interval=config.train.log_interval, 
                  debug_limit=config.train.debug_limit,
