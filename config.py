@@ -34,7 +34,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 2
+    batch_size: int = 1
     epochs: int = 200
     lr: float = 5e-4
     log_interval: int = 5 
