@@ -100,8 +100,8 @@ class KGATrainer:
 
         # 选择性构建 AD、Af、An（用于教师/基线度量）
         self.AD = self._load_model(config.kga.ad_checkpoint) if load_AD else None
-        self.Af = self._load_model(config.kga.af_checkpoint) if load_Af else None
-        self.An = self._load_model(config.kga.an_checkpoint) if load_An else None
+        self.Af = self._load_model(config.kd.af_out_ckpt) if load_Af else None
+        self.An = self._load_model(config.kd.an_out_ckpt) if load_An else None
 
         # 载入Af的batch级NLL缓存（可选），用于免加载Af模型
         self.af_nll_batches = None
