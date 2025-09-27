@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Dict, Optional
 from config import config
-from model.model_wrapper import GenerativeQwenVLModel
+from model.model_wrapper import GenerativeQwenVLModel, auto_load_lora_or_pt
 from torchvision.transforms import ToTensor
 
 # 可选：PEFT 适配器加载
@@ -174,13 +174,9 @@ class KGATrainer:
             pass
         if ckpt_path:
             try:
-                if os.path.isdir(str(ckpt_path)) and (PeftModel is not None):
-                    # 作为LoRA适配器目录加载
-                    model.model = PeftModel.from_pretrained(model.model, str(ckpt_path))
-                    logging.info(f"[Trainer] 已从LoRA目录加载适配器: {ckpt_path}")
-                else:
-                    state = torch.load(ckpt_path, map_location=model.device)
-                    model.load_state_dict(state)
+                # 统一从同名目录优先加载LoRA适配器，其次回退全量.pt
+                model.model = auto_load_lora_or_pt(model.model, str(ckpt_path), device=model.device)
+                logging.info(f"[Trainer] 已加载权重: {ckpt_path}")
             except Exception as e:
                 logging.warning(f"[Trainer] 加载checkpoint失败 {ckpt_path}: {e}")
         return model

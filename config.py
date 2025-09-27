@@ -76,8 +76,8 @@ class KDConfig:
     student_model_name: Optional[str] = "Qwen/Qwen2-VL-2B-Instruct"     # 默认学生模型
     teacher_ckpt: Optional[str] = None           # 若为None，默认使用 config.kga.ad_checkpoint
     student_init_ckpt: Optional[str] = None      # 学生初始化权重（可选）
-    an_out_ckpt: str = "weights/an_student.pt"      # 训练完成的 An 输出路径
-    af_out_ckpt: str = "weights/af_student.pt"      # 训练完成的 Af 输出路径
+    an_out_ckpt: str = "weights/an_student"      # 训练完成的 An 输出路径（LoRA适配器目录）
+    af_out_ckpt: str = "weights/af_student"      # 训练完成的 Af 输出路径（LoRA适配器目录）
     gen_max_len: int = 1024                       # 教师生成伪标签的最长长度
     gen_temperature: float = 0.7                 # 教师生成温度
 

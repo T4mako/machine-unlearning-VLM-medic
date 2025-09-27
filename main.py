@@ -1,6 +1,6 @@
 from venv import logger
 from data.load_PubMedVision import prepare_datasets
-from model.model_wrapper import GenerativeQwenVLModel
+from model.model_wrapper import GenerativeQwenVLModel, auto_load_lora_or_pt
 from train.trainer import KGATrainer
 from eval import kga_eval
 from config import config
@@ -27,7 +27,7 @@ def compute_baseline_gap_singleton(model_name: str, ckpt_ad: str, ckpt_an: str, 
     """仅加载一次模型实例，顺序加载AD/An权重，按batch计算在 Dn 上的“知识差距”基线。
     注：理论上差距应为KL散度 E[KL(P_AD || P_An)]；出于显存与存储的可控性，这里采用常见的NLL差近似 E_batch[ |NLL_AD - NLL_An| ]，与训练阶段保持一致。
     """
-    model = GenerativeQwenVLModel(model_name=model_name, use_fast=config.model.use_fast)
+    model = GenerativeQwenVLModel(model_name=model_name, use_fast=config.model.use_fast, lora_enabled=False)
     try:
         model.enable_unlearning(False)
     except Exception:
@@ -37,18 +37,8 @@ def compute_baseline_gap_singleton(model_name: str, ckpt_ad: str, ckpt_an: str, 
         logging.info(f"==========[GAP] 尝试加载checkpoint: {ckpt}")
         if ckpt:
             try:
-                if os.path.isdir(str(ckpt)):
-                    try:
-                        from peft import PeftModel
-                        model.model = PeftModel.from_pretrained(model.model, str(ckpt))
-                        logging.info(f"[GAP] 已加载LoRA适配器: {ckpt}")
-                    except Exception as e:
-                        logging.warning(f"[GAP] LoRA适配器加载失败，回退到全量权重: {e}")
-                        state = torch.load(ckpt, map_location=model.device)
-                        model.load_state_dict(state)
-                else:
-                    state = torch.load(ckpt, map_location=model.device)
-                    model.load_state_dict(state)
+                model.model = auto_load_lora_or_pt(model.model, str(ckpt), device=model.device)
+                logging.info(f"[GAP] 已加载权重: {ckpt}")
             except Exception as e:
                 logging.warning(f"[GAP] 加载checkpoint失败，将使用预训练权重: {e}")
 
@@ -83,7 +73,7 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
     import logging
 
     # 先评估 AD 在 Dn 上的 NLL
-    AD = GenerativeQwenVLModel(model_name=ad_model_name, use_fast=config.model.use_fast)
+    AD = GenerativeQwenVLModel(model_name=ad_model_name, use_fast=config.model.use_fast, lora_enabled=False)
     try:
         AD.enable_unlearning(False)
     except Exception:
@@ -118,6 +108,7 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
 
     # 再评估 An 在 Dn 上的 NLL
     An = GenerativeQwenVLModel(model_name=an_model_name, use_fast=config.model.use_fast,lora_enabled=False)
+    An = GenerativeQwenVLModel(model_name=an_model_name, use_fast=config.model.use_fast, lora_enabled=False)
     try:
         An.enable_unlearning(False)
     except Exception:
@@ -158,14 +149,16 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
                         logging.info(f"[GAP] 已加载全量权重文件: {pt_file}")
                     else:
                         raise FileNotFoundError(f"未找到全量权重文件: {pt_file}")
-            else:
-                logging.info(f"[GAP] 尝试加载全量权重文件: {ckpt_an_path}")
-                state = torch.load(ckpt_an_path, map_location=An.device)
-                An.load_state_dict(state)
-            logging.info(f"[GAP] 已加载 An checkpoint/适配器: {ckpt_an_path}")
+        finally:
+            logging.info(f"[GAP] 完成 An checkpoint 加载尝试")
+    if ckpt_an:
+        logging.info(f"[GAP] 尝试加载An checkpoint: {ckpt_an}")
+        try:
+            An.model = auto_load_lora_or_pt(An.model, str(ckpt_an), device=An.device)
+            logging.info(f"[GAP] 已加载 An 权重: {ckpt_an}")
         except Exception as e:
-            logging.error(f"[GAP] 加载 An checkpoint 失败（{type(e).__name__}）: {e}")
-            logging.warning("[GAP] 将使用预训练权重")
+            logging.warning(f"[GAP] 加载 An 失败，将使用预训练权重: {e}")
+
     nll_an = []
     for images, texts, targets in _iter_batches(dn_data, config.train.batch_size, getattr(config.train, 'debug_limit', None)):
         nll = An.compute_nll(images, texts, targets)
@@ -185,13 +178,17 @@ def compute_baseline_gap_dual(ad_model_name: str, ckpt_ad: str, an_model_name: s
 def precompute_af_nll_singleton(model_name: str, ckpt_af: str, forget_data, out_path: str):
     """仅加载一次模型实例，加载Af权重（在 Df 上训练的辅助模型），按batch计算在 Df 上的NLL均值并缓存到磁盘（逐样本nll同时保存便于校验）。"""
     model = GenerativeQwenVLModel(model_name=model_name, use_fast=config.model.use_fast,lora_enabled=False)
+    model = GenerativeQwenVLModel(model_name=model_name, use_fast=config.model.use_fast, lora_enabled=False)
     try:
         model.enable_unlearning(False)
     except Exception:
         pass
     if ckpt_af:
-        state = torch.load(ckpt_af, map_location=model.device)
-        model.load_state_dict(state)
+        try:
+            model.model = auto_load_lora_or_pt(model.model, str(ckpt_af), device=model.device)
+            logging.info(f"[KGA] 已加载 Af 权重: {ckpt_af}")
+        except Exception as e:
+            logging.warning(f"[KGA] 加载 Af 权重失败，将使用预训练权重: {e}")
 
     per_sample = []
     per_batch = []
