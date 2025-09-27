@@ -470,7 +470,7 @@ class GenerativeQwenVLModel(nn.Module):
             head = None
             try:
                 head = self.model.get_output_embeddings()
-                logging.info(f"成功获取输出嵌入层: {head}")
+                # logging.info(f"成功获取输出嵌入层: {head}")
             except Exception:
                 head = getattr(self.model, "lm_head", None)
 
