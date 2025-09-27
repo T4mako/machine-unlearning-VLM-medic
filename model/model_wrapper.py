@@ -152,21 +152,44 @@ class GenerativeQwenVLModel(nn.Module):
                 )
                 logging.info("模型已加载（文本-only CausalLM）")
 
-        # ===== 遗忘层 =====
+        # ===== 遗忘层（两种模式：per-layer adapters 或 last_hidden） =====
         logging.info(f"模型{model_name}初始化遗忘层...")
         self.hidden_size = int(getattr(self.model.config, "hidden_size", 1024))
         self.unl_enabled: bool = bool(self.enable_unl_cfg)
         self.unl_hidden_dim: int = int(self.unl_hidden_dim_cfg)
+        # 旧模式：仅在最后一层后接一个 UnlearningLayer
         self.unlearning_layer: Optional[UnlearningLayer] = None
+        # 新模式：每层FFN后插入适配器
+        self.unl_adapters: List[nn.Module] = []
+        self.unl_mode: str = "disabled"
         if self.unl_enabled and self.hidden_size > 0:
-            self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+            # 优先尝试 per-layer 适配器
+            try:
+                inserted = self._inject_unl_adapters()
+                if inserted > 0:
+                    self.unl_mode = "per_layer"
+                    logging.info(f"[UNL] 已在Transformer各层FFN后注入适配器: {inserted} 个")
+                else:
+                    # 回退：仅使用最后一层的单适配器
+                    self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+                    self.unl_mode = "last_hidden"
+                    logging.info("[UNL] 未识别到可注入的FFN，回退为 last_hidden 模式")
+            except Exception as e:
+                logging.warning(f"[UNL] 注入per-layer适配器失败: {e}，回退为 last_hidden 模式")
+                self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+                self.unl_mode = "last_hidden"
 
-        # 冻结主干模型参数，只训练遗忘层
-        if self.unl_enabled and self.unlearning_layer is not None:
+        # 冻结主干模型参数，只训练遗忘层/适配器
+        if self.unl_enabled and (self.unl_mode != "disabled"):
             for param in self.model.parameters():
                 param.requires_grad = False
-            for param in self.unlearning_layer.parameters():
-                param.requires_grad = True
+            if self.unl_mode == "per_layer" and len(self.unl_adapters) > 0:
+                for m in self.unl_adapters:
+                    for p in m.parameters():
+                        p.requires_grad = True
+            elif self.unlearning_layer is not None:
+                for param in self.unlearning_layer.parameters():
+                    param.requires_grad = True
 
         # 禁用 use_cache 以兼容梯度检查点
         try:
@@ -210,6 +233,11 @@ class GenerativeQwenVLModel(nn.Module):
         self.unl_enabled = bool(enabled)
 
     def get_unlearning_parameters(self):
+        if hasattr(self, "unl_adapters") and len(self.unl_adapters) > 0:
+            params: List[torch.nn.Parameter] = []
+            for m in self.unl_adapters:
+                params.extend(list(m.parameters()))
+            return params
         return list(self.unlearning_layer.parameters()) if (self.unlearning_layer is not None) else []
 
     def _apply_unl(self, last_hidden: torch.Tensor) -> torch.Tensor:
@@ -220,6 +248,62 @@ class GenerativeQwenVLModel(nn.Module):
         x = last_hidden.reshape(-1, H)
         y = self.unlearning_layer(x)
         return y.reshape(B, T, H).clone()  # 确保输出连接到计算图
+
+    # 新增：在各层FFN后注入遗忘适配器
+    def _inject_unl_adapters(self) -> int:
+        count = 0
+        blocks = self._find_transformer_blocks()
+        mlp_names = ["mlp", "feed_forward", "ffn", "ff", "mlp1", "mlp2"]
+        for blk in blocks:
+            for name in mlp_names:
+                if hasattr(blk, name):
+                    sub = getattr(blk, name)
+                    if isinstance(sub, nn.Module):
+                        adapter = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
+                        wrapped = nn.Sequential(sub, adapter)
+                        setattr(blk, name, wrapped)
+                        self.unl_adapters.append(adapter)
+                        count += 1
+                        break
+        return count
+
+    # 发现Transformer层（尽可能兼容不同结构）
+    def _find_transformer_blocks(self) -> List[nn.Module]:
+        blocks: List[nn.Module] = []
+        m = self.model
+        paths = [
+            ("language_model", "model", "layers"),
+            ("model", "layers"),
+            ("transformer", "h"),
+            ("transformer", "blocks"),
+            ("decoder", "layers"),
+        ]
+        for path in paths:
+            cur = m
+            ok = True
+            for attr in path:
+                if hasattr(cur, attr):
+                    cur = getattr(cur, attr)
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(cur, (nn.ModuleList, list, tuple)) and len(cur) > 0:
+                for b in cur:
+                    blocks.append(b)
+                if len(blocks) > 0:
+                    return blocks
+        # 回退：基于启发式扫描
+        for mod in m.modules():
+            if hasattr(mod, "mlp") or hasattr(mod, "feed_forward") or hasattr(mod, "ffn") or hasattr(mod, "ff"):
+                blocks.append(mod)
+        # 去重
+        uniq = []
+        seen = set()
+        for b in blocks:
+            if id(b) not in seen:
+                uniq.append(b)
+                seen.add(id(b))
+        return uniq
 
     # ===== 图像预处理保持不变（文本-only 时会忽略） =====
     def _ensure_pil_list(self, x):
@@ -238,222 +322,8 @@ class GenerativeQwenVLModel(nn.Module):
         B = len(texts)
         if targets is None:
             enc = tokenizer(
-                texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.max_seq_len,
             )
-            for k, v in enc.items():
-                if isinstance(v, torch.Tensor):
-                    enc[k] = v.to(self.device)
-            return enc
-        else:
-            if isinstance(targets, str):
-                targets = [targets]
-            if len(targets) == 1 and B > 1:
-                targets = [targets[0] for _ in range(B)]
-            if len(targets) != B:
-                raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
-            # 逐样本构建 input_ids 与 labels，遮住 prompt 部分
-            input_ids_list = []
-            labels_list = []
-            attn_list = []
-            for t, y in zip(texts, targets):
-                ids_prompt = tokenizer.encode(t, add_special_tokens=False)
-                ids_target = tokenizer.encode(y, add_special_tokens=False)
-                eos_id = tokenizer.eos_token_id
-                if eos_id is not None:
-                    full = ids_prompt + ids_target + [eos_id]
-                else:
-                    full = ids_prompt + ids_target
-                input_ids_tensor = torch.tensor(full, dtype=torch.long)
-                labels_tensor = input_ids_tensor.clone()
-                labels_tensor[:len(ids_prompt)] = -100
-                attn_tensor = torch.ones_like(labels_tensor, dtype=torch.long)
-                input_ids_list.append(input_ids_tensor)
-                labels_list.append(labels_tensor)
-                attn_list.append(attn_tensor)
-            max_len = max(x.size(0) for x in input_ids_list)
-            def pad_to(x, val):
-                if x.size(0) == max_len:
-                    return x
-                pad = torch.full((max_len - x.size(0),), val, dtype=x.dtype)
-                return torch.cat([x, pad], dim=0)
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
-            input_ids = torch.stack([pad_to(x, pad_id) for x in input_ids_list], dim=0)
-            labels = torch.stack([pad_to(x, -100) for x in labels_list], dim=0)
-            attention_mask = torch.stack([pad_to(x, 0) for x in attn_list], dim=0)
-            return {
-                "input_ids": input_ids.to(self.device),
-                "attention_mask": attention_mask.to(self.device),
-                "labels": labels.to(self.device),
-            }
-
-    # 新增：将任意输入规格统一为“每条样本一个PIL列表”的批格式 List[List[PIL]]，并在训练时限制分辨率
-    def _ensure_pil_per_sample(self, images) -> List[List]:
-        """支持以下输入：
-        - 单张图：PIL/tensor -> [[PIL]]
-        - 单样本多图：List[PIL/tensor] -> [List[PIL]]
-        - Batch：List[ Pils 或 List[PIL] ] -> List[List[PIL]]
-        附加：若配置了 max_image_res，则按最长边缩放至不超过该分辨率。
-        """
-        def to_pil(x):
-            return self._ensure_pil_list(x)[0] if not isinstance(x, list) else [self._ensure_pil_list(i)[0] for i in x]
-
-        def maybe_resize(pil):
-            max_res = int(self.max_image_res)
-            if max_res <= 0:
-                return pil
-            try:
-                w, h = pil.size
-                scale = min(1.0, float(max_res) / float(max(w, h)))
-                if scale < 1.0:
-                    new_w = max(1, int(w * scale))
-                    new_h = max(1, int(h * scale))
-                    return pil.resize((new_w, new_h))
-            except Exception:
-                pass
-            return pil
-
-        def ensure_pil_list_and_resize(x):
-            lst = self._ensure_pil_list(x)
-            return [maybe_resize(i) for i in lst]
-
-        if isinstance(images, list):
-            # 判定是否为 batch（元素本身是列表或混合）
-            if any(isinstance(el, list) for el in images):
-                batch = []
-                for el in images:
-                    if isinstance(el, list):
-                        batch.append(ensure_pil_list_and_resize(el))
-                    else:
-                        batch.append(ensure_pil_list_and_resize(el))  # 单图样本
-                return batch
-            else:
-                # 单样本多图
-                return [ensure_pil_list_and_resize(images)]
-        else:
-            # 单样本单图
-            return [[ensure_pil_list_and_resize(images)[0]]]
-
-    def _prepare_inputs(self, images, texts, targets: Optional[List[str]] = None):
-        """准备模型输入；当提供targets时，构造labels与input_ids等长，并对prompt部分置-100。
-        支持原生多图：images可以是 List[List[PIL]]（batch级），或 List[PIL]（单样本多图），或单图。
-        文本-only模型将忽略 images。
-        """
-        # 文本-only 路径
-        if self.text_only:
-            return self._prepare_inputs_text_only(texts, targets)
-        # logging.info(f"[KD] 文字样本数 {len(texts)} | 图片样本数 {len(images)} | 目标数 {len(targets)}")
-        # texts 统一成列表
-        if isinstance(texts, str):
-            texts = [texts]
-        # 图像规范化为“每条样本的图像列表”的批格式
-        images_per_sample = self._ensure_pil_per_sample(images)  # List[List[PIL]]
-        B = len(images_per_sample)
-        # logging.info(f"[KD] B样本数 {B}")
-
-        # 文本广播/对齐
-        if len(texts) == 1 and B > 1:
-            texts = [texts[0] for _ in range(B)]
-        if len(texts) != B:
-            raise ValueError(f"Texts and images batch size mismatch: {len(texts)} vs {B}")
-
-        # 构造仅prompt的对话（多次 {image} + text）
-        convs_user_only = []
-        for t, imgs in zip(texts, images_per_sample):
-            content = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
-            convs_user_only.append([{ "role": "user", "content": content }])
-        if targets is None:
-            # 推理：只构造用户轮，添加generation prompt
-            prompt_texts = self.processor.apply_chat_template(
-                convs_user_only, tokenize=False, add_generation_prompt=True
-            )
-            inputs = self.processor(
-                text=prompt_texts, images=images_per_sample,
-                return_tensors="pt", padding=True
-            )
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(self.device)
-            return inputs
-        else:
-            # 统一targets长度
-            if isinstance(targets, str):
-                targets = [targets]
-            if len(targets) == 1 and B > 1:
-                targets = [targets[0] for _ in range(B)]
-            if len(targets) != B:
-                raise ValueError(f"Targets and batch size mismatch: {len(targets)} vs {B}")
-            # 1) 获取每条样本prompt的token长度（包含多图占位）
-            prompt_token_ids_list = self.processor.apply_chat_template(
-                convs_user_only, tokenize=True, add_generation_prompt=True
-            )
-            if isinstance(prompt_token_ids_list[0], int):
-                prompt_token_ids_list = [prompt_token_ids_list]
-
-            # 2) 构造包含assistant回复的完整对话
-            convs_full = []
-            for t, y, imgs in zip(texts, targets, images_per_sample):
-                content_user = [{"type": "image"} for _ in imgs] + [{"type": "text", "text": t}]
-                convs_full.append([
-                    {"role": "user", "content": content_user},
-                    {"role": "assistant", "content": [{"type": "text", "text": y}]}
-                ])
-
-            full_texts = self.processor.apply_chat_template(
-                convs_full, tokenize=False, add_generation_prompt=False
-            )
-            inputs = self.processor(
-                text=full_texts,
-                images=images_per_sample,
-                return_tensors="pt",
-                padding=True,
-            )
-            # 3) 将 prompt 部分 labels 置 -100
-            labels = inputs.get("labels", None)
-            input_ids = inputs.get("input_ids", None)
-            if (labels is None) and (input_ids is not None):
-                labels = input_ids.clone()
-            if labels is not None:
-                for b_idx, prompt_ids in enumerate(prompt_token_ids_list):
-                    n_prompt = len(prompt_ids)
-                    labels[b_idx, :n_prompt] = -100
-                inputs["labels"] = labels
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(self.device)
-            return inputs
-
-    def generate(self, images, texts: Union[str, List[str]], max_new_tokens: int = 128, do_sample: bool = True, temperature: float = 0.7):
-        inputs = self._prepare_inputs(images, texts, targets=None)
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-        )
-        with torch.no_grad():
-            out = self.model.generate(**inputs, **gen_kwargs)
-        if self.text_only:
-            # 文本-only，直接解码
-            tokenizer = self.processor  # type: ignore
-            return tokenizer.batch_decode(out, skip_special_tokens=True)
-        # 多模态
-        return self.processor.batch_decode(out, skip_special_tokens=True)
-
-    def compute_nll(self, images, texts: Union[str, List[str]], targets: Union[str, List[str]]):
-        """返回负对数似然（越小越好）"""
-        inputs = self._prepare_inputs(images, texts, targets)
-        with torch.no_grad():
-            out = self.model(**inputs)
-            logits = out.logits  # [B, T, V]
-            labels = inputs["labels"]  # [B, T]
-            # 交叉熵：仅计算 labels != -100 的位置
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100, reduction="mean")
-        return loss
+        # ... existing code ...
 
     def forward(self, images=None, texts: Union[str, List[str]] = None, targets: Union[str, List[str]] = None):
         """兼容旧训练接口：返回包含 loss 的对象（SimpleNamespace），以便 trainer 统一处理。"""
@@ -465,28 +335,24 @@ class GenerativeQwenVLModel(nn.Module):
         # 获取最后层隐藏状态并应用遗忘层（如启用）
         last_hidden = out.hidden_states[-1]
         logits = None
-        if self.unl_enabled and (self.unlearning_layer is not None):
+        # 当采用 per-layer 适配器时，模型内部已被修改，此处直接使用 out.logits
+        if hasattr(self, "unl_mode") and self.unl_mode == "per_layer":
+            logits = out.logits
+        elif self.unl_enabled and (self.unlearning_layer is not None) and (len(getattr(self, "unl_adapters", [])) == 0):
             last_hidden = self._apply_unl(last_hidden)
             head = None
             try:
                 head = self.model.get_output_embeddings()
-                # logging.info(f"成功获取输出嵌入层: {head}")
             except Exception:
                 head = getattr(self.model, "lm_head", None)
-
                 if head is None:
                     head = getattr(getattr(self.model, "language_model", None), "lm_head", None)
-                else:
-                    logging.warning(f"未找到合适的输出嵌入层，使用模型的 lm_head: {head}")
             if head is not None:
                 logits = head(last_hidden)
-                # logging.info(f"通过输出嵌入层得到 logits: {logits.shape}")
             else:
                 logits = out.logits
-                logging.info(f"未通过输出嵌入层，直接使用模型 logits: {logits.shape}")
         else:
             logits = out.logits
-            logging.info(f"未启用遗忘层，直接使用模型 logits: {logits.shape}")
         labels = inputs.get("labels")
         loss = None
         if labels is not None:
@@ -499,7 +365,10 @@ class GenerativeQwenVLModel(nn.Module):
         inputs = self._prepare_inputs(images, texts, targets)
         out = self.model(**inputs, output_hidden_states=True, use_cache=False)
         last_hidden = out.hidden_states[-1]
-        if self.unl_enabled and (self.unlearning_layer is not None):
+        # 当采用 per-layer 适配器时，模型内部已被修改，此处直接使用 out.logits
+        if hasattr(self, "unl_mode") and self.unl_mode == "per_layer":
+            logits = out.logits
+        elif self.unl_enabled and (self.unlearning_layer is not None) and (len(getattr(self, "unl_adapters", [])) == 0):
             last_hidden = self._apply_unl(last_hidden)
             head = None
             try:
