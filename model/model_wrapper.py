@@ -316,14 +316,83 @@ class GenerativeQwenVLModel(nn.Module):
 
     # 文本-only 输入准备（供 _prepare_inputs 调用）
     def _prepare_inputs_text_only(self, texts, targets: Optional[List[str]] = None):
+        """文本-only 输入准备：返回包含 input_ids/attention_mask 以及可选 labels 的字典。"""
         tokenizer = self.processor  # type: ignore
         if isinstance(texts, str):
             texts = [texts]
-        B = len(texts)
-        if targets is None:
-            enc = tokenizer(
+        enc = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_len,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self.device) for k, v in enc.items()}
+        if targets is not None:
+            if isinstance(targets, str):
+                targets = [targets]
+            lab = tokenizer(
+                targets,
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_len,
+                return_tensors="pt",
             )
-        # ... existing code ...
+            labels = lab["input_ids"].to(self.device)
+            if "attention_mask" in lab:
+                mask = lab["attention_mask"].to(self.device)
+                labels = labels.masked_fill(mask == 0, -100)
+            inputs["labels"] = labels
+        return inputs
+
+    def _prepare_inputs(self, images=None, texts: Union[str, List[str]] = None, targets: Optional[Union[str, List[str]]] = None):
+        """统一的输入准备：同时支持多模态与文本-only。"""
+        if self.text_only:
+            return self._prepare_inputs_text_only(texts, targets)
+        # 多模态路径
+        if isinstance(texts, str):
+            texts = [texts]
+        images_list = self._ensure_pil_list(images) if images is not None else None
+        # 使用 AutoProcessor 处理图像与文本
+        proc_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+        }
+        if images_list is not None:
+            proc_kwargs["images"] = images_list
+        if texts is not None:
+            proc_kwargs["text"] = texts
+        enc = self.processor(**proc_kwargs)
+        inputs = {k: v.to(self.device) for k, v in enc.items()}
+        # 处理 labels（若提供targets）
+        if targets is not None:
+            if isinstance(targets, str):
+                targets = [targets]
+            # 优先使用 processor 的 tokenizer（若存在）
+            tok = getattr(self.processor, "tokenizer", None)
+            if tok is None:
+                # 回退：文本-only tokenizer（极端情况）
+                tok = self.processor  # type: ignore
+            lab = tok(
+                targets,
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_len,
+                return_tensors="pt",
+            )
+            labels = lab["input_ids"].to(self.device)
+            if "attention_mask" in lab:
+                mask = lab["attention_mask"].to(self.device)
+                labels = labels.masked_fill(mask == 0, -100)
+            inputs["labels"] = labels
+        return inputs
+
+    def compute_nll(self, images=None, texts: Union[str, List[str]] = None, targets: Union[str, List[str]] = None):
+        """计算给定 batch 的平均 NLL。"""
+        out = self.forward(images, texts, targets)
+        if out.loss is None:
+            raise RuntimeError("compute_nll 需要提供 targets 以计算loss")
+        return out.loss
 
     def forward(self, images=None, texts: Union[str, List[str]] = None, targets: Union[str, List[str]] = None):
         """兼容旧训练接口：返回包含 loss 的对象（SimpleNamespace），以便 trainer 统一处理。"""

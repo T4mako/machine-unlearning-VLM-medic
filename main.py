@@ -591,9 +591,8 @@ def main():
         logging.info(f"【A*】模型初始化: {config.model.model_name} on device {A_star.device}")
         if config.kga.ad_checkpoint:
             try:
-                state = torch.load(config.kga.ad_checkpoint, map_location=A_star.device)
-                A_star.load_state_dict(state)
-                logging.info(f"[INFO] A* initialized from AD checkpoint: {config.kga.ad_checkpoint}")
+                A_star.model = auto_load_lora_or_pt(A_star.model, str(config.kga.ad_checkpoint), device=A_star.device)
+                logging.info(f"[INFO] A* initialized from AD checkpoint (auto load LoRA/PT): {config.kga.ad_checkpoint}")
             except Exception as e:
                 logging.warning(f"[WARN] Failed to load AD checkpoint for A*: {e}")
 
