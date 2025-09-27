@@ -470,16 +470,23 @@ class GenerativeQwenVLModel(nn.Module):
             head = None
             try:
                 head = self.model.get_output_embeddings()
+                logging.info(f"成功获取输出嵌入层: {head}")
             except Exception:
                 head = getattr(self.model, "lm_head", None)
+
                 if head is None:
                     head = getattr(getattr(self.model, "language_model", None), "lm_head", None)
+                else:
+                    logging.warning(f"未找到合适的输出嵌入层，使用模型的 lm_head: {head}")
             if head is not None:
                 logits = head(last_hidden)
+                logging.info(f"通过输出嵌入层得到 logits: {logits.shape}")
             else:
                 logits = out.logits
+                logging.info(f"未通过输出嵌入层，直接使用模型 logits: {logits.shape}")
         else:
             logits = out.logits
+            logging.info(f"未启用遗忘层，直接使用模型 logits: {logits.shape}")
         labels = inputs.get("labels")
         loss = None
         if labels is not None:

@@ -17,7 +17,7 @@ class ModelConfig:
     # === 新增：低显存训练开关 ===
     precision: str = "bf16"            # "bf16" 或 "fp16"
     load_in_4bit: bool = True          # 是否以 4-bit 量化加载（QLoRA）
-    gradient_checkpointing: bool = True  # 是否开启梯度检查点
+    gradient_checkpointing: bool = False  # 是否开启梯度检查点
     device_map: str = "auto"           # 模型设备映射
     offload_folder: str = "offload"    # 当需要 CPU/NVMe offload 时的目录
     # LoRA 配置（仅当 lora_enabled=True 时生效）
@@ -34,7 +34,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 1
+    batch_size: int = 4
     epochs: int = 200
     lr: float = 5e-4
     log_interval: int = 5 
@@ -56,7 +56,7 @@ class EvalConfig:
 
 @dataclass
 class KGAConfig:
-    alpha: float = 1.0               # 保持项权重：L = L_forget + alpha * L_retain + beta * L_gap
+    alpha: float = 0.0               # 保持项权重：L = L_forget + alpha * L_retain + beta * L_gap
     sigma: float = 0.2               # 早停阈值比例：对齐误差 <= sigma * |基线差距|
     dn_ratio: float = 0.1            # 从全体样本中划出外部集 Dn 比例（简化近似）
     ad_checkpoint: Optional[str] = None  # 原始模型 AD 的 checkpoint（如无则用基础模型权重）
