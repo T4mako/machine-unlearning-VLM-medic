@@ -587,7 +587,7 @@ def main():
                 except Exception as e:
                     logging.warning(f"[KGA] 读取 baseline_gap 文件失败: {e}")
 
-        A_star = GenerativeQwenVLModel(model_name=config.model.model_name, use_fast=config.model.use_fast, enable_unl=True, load_in_4bit= False,lora_enabled=False)
+        A_star = GenerativeQwenVLModel(model_name=config.model.model_name, use_fast=config.model.use_fast, enable_unl=False, load_in_4bit= False,lora_enabled=False)
         logging.info(f"【A*】模型初始化: {config.model.model_name} on device {A_star.device}")
         if config.kga.ad_checkpoint:
             try:
