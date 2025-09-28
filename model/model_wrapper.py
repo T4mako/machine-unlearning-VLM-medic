@@ -51,7 +51,7 @@ class GenerativeQwenVLModel(nn.Module):
         precision: Optional[str] = None, # 精度，默认全局config.model.precision
         load_in_4bit: Optional[bool] = None, # 是否加载4bit模型
         gradient_checkpointing: Optional[bool] = None, # 是否开启梯度检查点
-        lora_enabled: Optional[bool] = None, # 是否开启LoRA
+        lora_enabled: Optional[bool] = None, # 是否开启LoRA(A*)
         lora_r: Optional[int] = None, # LoRA的秩，默认全局config.model.lora_r
         lora_alpha: Optional[int] = None, # LoRA的缩放系数，默认全局config.model.lora_alpha
         lora_dropout: Optional[float] = None, # LoRA的dropout率，默认全局config.model.lora_dropout
@@ -67,7 +67,8 @@ class GenerativeQwenVLModel(nn.Module):
         self.precision = (precision or config.model.precision)
         self.load_in_4bit = bool(config.model.load_in_4bit if load_in_4bit is None else load_in_4bit)
         self.gradient_checkpointing = bool(config.model.gradient_checkpointing if gradient_checkpointing is None else gradient_checkpointing)
-        self.lora_enabled = bool(config.model.lora_enabled if lora_enabled is None else lora_enabled)
+        # 绑定LoRA到 qlora_astar_enabled
+        self.lora_enabled = bool(getattr(config.model, "qlora_astar_enabled", False) if lora_enabled is None else lora_enabled)
         self.lora_r = int(config.model.lora_r if lora_r is None else lora_r)
         self.lora_alpha = int(config.model.lora_alpha if lora_alpha is None else lora_alpha)
         self.lora_dropout = float(config.model.lora_dropout if lora_dropout is None else lora_dropout)
@@ -161,12 +162,12 @@ class GenerativeQwenVLModel(nn.Module):
         if self.unl_enabled and self.hidden_size > 0:
             self.unlearning_layer = UnlearningLayer(self.hidden_size, hidden_dim=self.unl_hidden_dim).to(self.device)
 
-        # 冻结主干模型参数，只训练遗忘层
-        if self.unl_enabled and self.unlearning_layer is not None:
-            for param in self.model.parameters():
-                param.requires_grad = False
+        # 统一冻结主干参数，并按开关启用可训练权重
+        for param in self.model.parameters():
+            param.requires_grad = False
+        if self.unlearning_layer is not None:
             for param in self.unlearning_layer.parameters():
-                param.requires_grad = True
+                param.requires_grad = bool(getattr(config.model, "qlora_unl_enabled", False))
 
         # 禁用 use_cache 以兼容梯度检查点
         try:
@@ -197,9 +198,9 @@ class GenerativeQwenVLModel(nn.Module):
                 task_type="CAUSAL_LM",
             )
             self.model = get_peft_model(self.model, lora_cfg)
+            # 冻结主干，仅开放LoRA权重
             for p in self.model.parameters():
                 p.requires_grad = False
-            # 仅 LoRA 权重训练
             for name, p in self.model.named_parameters():
                 if "lora" in name:
                     p.requires_grad = True

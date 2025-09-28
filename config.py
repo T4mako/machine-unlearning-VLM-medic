@@ -20,13 +20,16 @@ class ModelConfig:
     gradient_checkpointing: bool = False  # 是否开启梯度检查点
     device_map: str = "auto"           # 模型设备映射
     offload_folder: str = "offload"    # 当需要 CPU/NVMe offload 时的目录
-    # LoRA 配置（仅当 lora_enabled=True 时生效）
+    # === 新增：QLoRA训练开关（A*与遗忘层）===
+    qlora_astar_enabled: bool = True   # 是否仅训练LoRA(A*)
+    qlora_unl_enabled: bool = False    # 是否训练遗忘层（UnlearningLayer）
+    # LoRA 配置（仅当 qlora_astar_enabled=True 时生效）
     lora_enabled: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "v_proj", "o_proj"", k_proj", "gate_proj", "up_proj", "down_proj"
+        "q_proj", "k_proj", "v_proj", "o_proj", "lm_head", "cross_attn"
     ])
     # 图像与文本上限（用于进一步降低显存）
     max_image_res: int = 256           # 训练阶段统一缩放至不超过该分辨率的正方形

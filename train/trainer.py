@@ -42,24 +42,11 @@ class KGATrainer:
                  af_nll_path: Optional[str] = None):
         self.A_star = A_star  # 待遗忘模型，初始化自 AD 权重
         
-        # 根据配置选择优化参数（是否只训练遗忘层）
-        if bool(getattr(config.train, "freeze_backbone", True)) and len(self.A_star.get_unlearning_parameters()) > 0:
-            logging.info(f"[Trainer] 冻结主干，仅训练遗忘层，参数数量: {len(self.A_star.get_unlearning_parameters())}")
-            # 冻结主干，仅训练遗忘层
-            for p in self.A_star.model.parameters():
-                p.requires_grad = False
-            # 确保遗忘层参数可训练
-            for p in self.A_star.get_unlearning_parameters():
-                p.requires_grad = True
-            opt_params = list(self.A_star.get_unlearning_parameters())
-            # logging.info("[DEBUG] 冻结后遗忘层参数 requires_grad 状态:")
-            # for i, p in enumerate(opt_params):
-            #     logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
-        else:
-            opt_params = list(self.A_star.parameters())
-            logging.info("[DEBUG] 训练全部参数，数量: %d", len(opt_params))
-            for i, p in enumerate(opt_params):
-                logging.info(f"[DEBUG] param {i} shape={p.shape}, requires_grad={p.requires_grad}")
+        # 根据 requires_grad 自动选择可训练参数（兼容LoRA与遗忘层开关）
+        opt_params = [p for p in self.A_star.parameters() if getattr(p, 'requires_grad', False)]
+        trainable_count = sum(p.numel() for p in opt_params)
+        total_params = sum(p.numel() for p in self.A_star.parameters())
+        logging.info(f"[Trainer] 可训练参数张量数: {len(opt_params)} | 元素总数: {trainable_count}/{total_params}")
 
         # 训练精度与AMP
         self.precision = str(getattr(config.model, "precision", "bf16")).lower()
@@ -91,12 +78,12 @@ class KGATrainer:
         self.debug_limit = int(debug_limit) if debug_limit is not None else None
 
         # 超参（融合）
-        self.alpha = float(config.kga.alpha)      # 保持项权重
-        self.sigma = float(config.kga.sigma)      # 早停比例
+        self.alpha = float(config.kga.alpha)      # 保持项权重 (Lr)
+        self.sigma = float(config.kga.sigma)      # 对齐误差相对阈值
         self.use_nll_gap = bool(config.kga.use_nll_gap)
         self.objective = "fusion"                 # 统一为融合目标
-        self.lambda_f = float(getattr(config.kga, "lambda_f", 1.0))  # 遗忘项权重
-        self.beta = float(getattr(config.kga, "beta", 1.0))          # 知识差距项权重
+        self.lambda_f = float(getattr(config.kga, "lambda_f", 1.0))  # （保留以向后兼容，未使用）
+        self.beta = float(getattr(config.kga, "beta", 1.0))          # 对齐项权重
 
         # 选择性构建 AD、Af、An（用于教师/基线度量）
         self.AD = self._load_model(config.kga.ad_checkpoint) if load_AD else None
@@ -209,29 +196,34 @@ class KGATrainer:
         # 融合目标依赖项检查：按权重启用
         gap_enabled = (self.beta > 0.0) and ((self.Af is not None) or (self.af_nll_batches is not None))
         if self.alpha > 0.0 and self.AD is None:
-            print("[Fusion][WARN] alpha>0 但未加载AD，保持项将被跳过（L_retain=0）。如需启用请设置 load_AD=True 或提供 AD 权重。")
+            print("[Fusion][WARN] alpha>0 但未加载AD，保持项将被跳过（L_r=0）。如需启用请设置 load_AD=True 或提供 AD 权重。")
         if (self.beta > 0.0) and not gap_enabled:
-            print("[Fusion][WARN] beta>0 但未加载Af且未提供Af-NLL缓存，知识差距项将被跳过（L_gap=0）。如需启用请设置 load_Af=True 或提供 af_nll_path。")
-        if not gap_enabled:
-            # 未启用gap项时无需An/baseline_gap
-            pass
-        else:
+            print("[Fusion][WARN] beta>0 但未加载Af且未提供Af-NLL缓存，对齐项将被跳过（L_gap=0）。如需启用请设置 load_Af=True 或提供 af_nll_path。")
+        if gap_enabled:
             if (self.An is None) and (self.baseline_gap == 0.0):
                 print("[Fusion][WARN] 未加载An且未提供baseline_gap_override，baseline_gap将为0，早停阈值可能过低。建议提供baseline_gap_override或启用load_An计算。")
 
-        # 初始知识差距（可选）：在 Df 上度量 AD 与 Af 的差距
+        # 初始对齐误差（可选）：在 Df 上度量 |La - G|
         with torch.no_grad():
-            if gap_enabled and (self.AD is not None) and (self.Af is not None):
-                init_gap = self._estimate_baseline_gap(self.AD, self.Af, self.forget_data)
-                print(f"[Fusion] Initial gap on Df between AD and Af: {init_gap:.6f}")
+            if gap_enabled and (self.Af is not None):
+                init_align_err = 0.0
+                cnt = 0
+                for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
+                    nll_astar = float(self.A_star.compute_nll(images, texts, targets).item())
+                    nll_af = float(self.Af.compute_nll(images, texts, targets).item())
+                    La = abs(nll_astar - nll_af)
+                    init_align_err += abs(La - float(self.baseline_gap))
+                    cnt += 1
+                init_align_err /= max(cnt, 1)
+                print(f"[Fusion] Initial alignment error on Df: {init_align_err:.6f}")
             else:
-                print("[Fusion] Skipping initial AD-Af gap computation (disabled or missing models/cache).")
+                print("[Fusion] Skipping initial alignment error computation (disabled or missing Af/cache).")
 
-        # 早停阈值（仅在gap项启用时有意义）
+        # 早停阈值：|mean(La) - G| <= sigma * |G|
         target_threshold = None
         if gap_enabled:
-            target_threshold = self.sigma * max(self.baseline_gap, 1e-8)
-            print(f"[Fusion] Early-stop threshold: {target_threshold:.6f}")
+            target_threshold = self.sigma * max(abs(self.baseline_gap), 1e-8)
+            print(f"[Fusion] Early-stop threshold (relative to G): {target_threshold:.6f}")
         else:
             print("[Fusion] Early-stop disabled (gap term not enabled).")
 
@@ -273,12 +265,9 @@ class KGATrainer:
 
                 # 前向与损失构造（AMP）
                 with _autocast(device_type="cuda", dtype=self._amp_dtype):
-                    # 1) 遗忘项（Df）：最大化 A* 在 Df 上的 NLL
+                    # 1) Df 上的对齐项 La = |NLL(A*) - NLL(Af)|
                     out_f = self.A_star.forward(images, texts, targets)
                     nll_astar = out_f.loss  # 需要梯度
-                    L_forget = - nll_astar
-
-                    # 2) 知识差距项（Df）：仅在启用时计算
                     if gap_enabled:
                         if self.Af is not None:
                             with torch.no_grad():
@@ -287,13 +276,23 @@ class KGATrainer:
                             if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
                                 raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
                             nll_af = torch.tensor(self.af_nll_batches[step], device=self.A_star.device, dtype=nll_astar.dtype)
-                        gap_star = torch.abs(nll_astar - nll_af)
-                        gap_base = torch.tensor(self.baseline_gap, device=self.A_star.device, dtype=gap_star.dtype)
-                        L_gap = torch.abs(gap_star - gap_base)
+                        La = torch.abs(nll_astar - nll_af)
+                        gap_base = torch.tensor(self.baseline_gap, device=self.A_star.device, dtype=La.dtype)
+                        L_gap = torch.abs(La - gap_base)
                     else:
+                        # 若未启用gap项，则仍定义 La 作为忘记对齐（默认与 Af 距离），但 Af 缓存不可用时置0
+                        try:
+                            if self.Af is not None:
+                                with torch.no_grad():
+                                    nll_af = self.Af.compute_nll(images, texts, targets)
+                                La = torch.abs(nll_astar - nll_af)
+                            else:
+                                La = torch.tensor(0.0, device=self.A_star.device)
+                        except Exception:
+                            La = torch.tensor(0.0, device=self.A_star.device)
                         L_gap = torch.tensor(0.0, device=self.A_star.device)
 
-                    # 3) 保持项（Dr）：仅当启用且AD存在时计算
+                    # 2) Dr 上的保持项 Lr = |NLL(A*) - NLL(AD)|
                     if (self.alpha > 0.0) and (len(self.retain_data) > 0) and (self.AD is not None):
                         ridx = (global_step + step) % max(len(self.retain_data), 1)
                         r_end = min(ridx + self.batch_size, len(self.retain_data))
@@ -309,8 +308,8 @@ class KGATrainer:
                     else:
                         L_retain = torch.tensor(0.0, device=self.A_star.device)
 
-                    # 组合损失
-                    loss = self.lambda_f * L_forget + self.alpha * L_retain + self.beta * L_gap
+                    # 组合损失：La + αLr + β|La - G|
+                    loss = La + self.alpha * L_retain + self.beta * L_gap
 
                 # 反向与优化（梯度累积 + AMP 梯度缩放）
                 loss_to_log = loss
@@ -336,7 +335,7 @@ class KGATrainer:
                 if (step + 1) % self.log_interval == 0 or (step + 1) == steps_total:
                     dt = time.time() - t0
                     ips = (total_steps * self.batch_size) / max(dt, 1e-6)
-                    print(f"[Fusion][train] step {step+1}/{steps_total} | L_forget={float(L_forget.item()):.4f} L_retain={float(L_retain.item()):.4f} L_gap={float(L_gap.item()):.4f} loss={float(loss_to_log.item()):.4f} | {ips:.1f} samples/s")
+                    print(f"[Fusion][train] step {step+1}/{steps_total} | La={float(La.item()):.4f} Lr={float(L_retain.item()):.4f} L_gap={float(L_gap.item()):.4f} loss={float(loss_to_log.item()):.4f} | {ips:.1f} samples/s")
 
             epoch_loss = total_loss / max(total_steps, 1)
             print(f"[Fusion] Epoch {epoch+1} avg loss: {epoch_loss:.6f}")
@@ -357,10 +356,10 @@ class KGATrainer:
                         pass
                     logging.info(f"====[UNL][epoch {epoch+1} post] {name} mean={mean_val:.6f} std={std_val:.6f} delta_l2={delta_l2:.6f}====")
 
-            # 监控当前在 Df 上的 gap_* 均值（仅在启用时）
+            # 监控当前在 Df 上的对齐误差均值 |La - G|（仅在启用时）
             if gap_enabled and (self.sigma > 0.0):
                 with torch.no_grad():
-                    current_gap = 0.0
+                    align_err = 0.0
                     cnt = 0
                     for images, texts, targets, step, steps_total in self._iter_batches(self.forget_data):
                         nll_astar = float(self.A_star.compute_nll(images, texts, targets).item())
@@ -370,13 +369,14 @@ class KGATrainer:
                             if (self.af_nll_batches is None) or (step >= len(self.af_nll_batches)):
                                 raise RuntimeError("Af NLL cache不可用或越界，请先运行 --mode precompute_af_nll 并确保batch_size/debug_limit一致。")
                             nll_af = float(self.af_nll_batches[step])
-                        current_gap += abs(nll_astar - nll_af)
+                        La_val = abs(nll_astar - nll_af)
+                        align_err += abs(La_val - float(self.baseline_gap))
                         cnt += 1
-                    current_gap /= max(cnt, 1)
-                print(f"[Fusion] Current gap_* on Df: {current_gap:.6f}")
+                    align_err /= max(cnt, 1)
+                print(f"[Fusion] Current alignment error on Df: {align_err:.6f}")
 
-                if (target_threshold is not None) and (current_gap <= target_threshold):
-                    print(f"[Fusion] Early stop: gap_* ({current_gap:.6f}) <= threshold ({target_threshold:.6f})")
+                if (target_threshold is not None) and (align_err <= target_threshold):
+                    print(f"[Fusion] Early stop: alignment error ({align_err:.6f}) <= threshold ({target_threshold:.6f})")
                     break
             else:
                 print("[Fusion] Skipping gap-based early stop (disabled).")
