@@ -239,6 +239,29 @@ class KGATrainer:
         self.optimizer.zero_grad()
         for epoch in range(epochs):
             print(f"[Fusion] Epoch {epoch+1}/{epochs}")
+            # ===== 遗忘层参数日志（Epoch 前）=====
+            if hasattr(self.A_star, "unlearning_layer") and (self.A_star.unlearning_layer is not None):
+                if epoch == 0:
+                    logging.info("====[UNL] 遗忘层已启用，开始记录每个epoch的参数变化====")
+                # 保存本epoch开始时的参数快照，用于计算delta
+                try:
+                    self._unl_prev_state = {
+                        name: p.detach().cpu().clone()
+                        for name, p in self.A_star.unlearning_layer.named_parameters()
+                    }
+                except Exception:
+                    self._unl_prev_state = {}
+                # 输出统计信息
+                for name, p in self.A_star.unlearning_layer.named_parameters():
+                    data = p.detach()
+                    mean_val = float(data.mean().item())
+                    std_val = float(data.std(unbiased=False).item())
+                    req = bool(p.requires_grad)
+                    logging.info(f"====[UNL][epoch {epoch+1} pre] {name} shape={tuple(p.shape)} requires_grad={req} mean={mean_val:.6f} std={std_val:.6f}====")
+            else:
+                if epoch == 0:
+                    logging.info("====[UNL] 遗忘层未启用，跳过参数日志====")
+
             total_loss = 0.0
             total_steps = 0
             t0 = time.time()
@@ -317,6 +340,22 @@ class KGATrainer:
 
             epoch_loss = total_loss / max(total_steps, 1)
             print(f"[Fusion] Epoch {epoch+1} avg loss: {epoch_loss:.6f}")
+
+            # ===== 遗忘层参数日志（Epoch 后 + Delta）=====
+            if hasattr(self.A_star, "unlearning_layer") and (self.A_star.unlearning_layer is not None):
+                for name, p in self.A_star.unlearning_layer.named_parameters():
+                    data = p.detach()
+                    mean_val = float(data.mean().item())
+                    std_val = float(data.std(unbiased=False).item())
+                    delta_l2 = float('nan')
+                    try:
+                        prev = self._unl_prev_state.get(name, None) if hasattr(self, "_unl_prev_state") else None
+                        if prev is not None:
+                            delta = data.detach().cpu() - prev
+                            delta_l2 = float(delta.norm(p=2).item())
+                    except Exception:
+                        pass
+                    logging.info(f"====[UNL][epoch {epoch+1} post] {name} mean={mean_val:.6f} std={std_val:.6f} delta_l2={delta_l2:.6f}====")
 
             # 监控当前在 Df 上的 gap_* 均值（仅在启用时）
             if gap_enabled and (self.sigma > 0.0):
